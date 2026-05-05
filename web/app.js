@@ -77,6 +77,11 @@
   const loadMoreBtn    = document.getElementById("load-more");
   const loadMoreInfo   = document.getElementById("load-more-info");
   const refreshBanner  = document.getElementById("refresh-banner");
+  const refreshAction  = document.getElementById("refresh-banner-action");
+  const refreshDismiss = document.getElementById("refresh-banner-dismiss");
+
+  // sessionStorage key for the "ack'd" generated_at — see showRefreshBanner / dismiss handlers.
+  const REFRESH_ACK_KEY = "daily-snapshot:refresh-ack-iso";
 
   // ---- State ------------------------------------------------------
   let allItems        = [];
@@ -174,18 +179,48 @@
       const data = await res.json();
       const fresh = data.generated_at ? new Date(data.generated_at) : null;
       if (!fresh || isNaN(fresh.getTime())) return;
-      // Strictly newer — equal timestamps mean same snapshot, no banner.
-      if (fresh.getTime() > generatedAt.getTime()) {
-        showRefreshBanner();
-      }
+      // Strictly newer than what's currently displayed — equal timestamps
+      // mean same snapshot, no banner.
+      if (fresh.getTime() <= generatedAt.getTime()) return;
+      // ALSO: don't re-prompt for a snapshot the user already acknowledged.
+      // This guards against two real-world flap cases:
+      //   1. GitHub Pages CDN propagation lag — different edges briefly serve
+      //      different versions, so the user can see a banner, click refresh,
+      //      reload, hit a stale edge, and immediately see the banner again.
+      //   2. Reload races — visibilitychange firing before loadData()
+      //      completes, then the polling getting a slightly newer file.
+      // We remember the latest generated_at the user has seen/dismissed in
+      // sessionStorage. The banner only shows if `fresh` exceeds BOTH the
+      // currently-loaded data AND the ack'd value.
+      const ack = getRefreshAck();
+      if (ack && fresh.getTime() <= ack) return;
+      showRefreshBanner(fresh);
     } catch (err) {
       // Network blip — quietly retry on next interval.
     }
   }
 
-  function showRefreshBanner() {
+  function showRefreshBanner(freshDate) {
     if (!refreshBanner) return;
     refreshBanner.hidden = false;
+    if (freshDate instanceof Date && !isNaN(freshDate.getTime())) {
+      refreshBanner.dataset.freshIso = freshDate.toISOString();
+    }
+  }
+
+  function getRefreshAck() {
+    try {
+      const v = sessionStorage.getItem(REFRESH_ACK_KEY);
+      if (!v) return null;
+      const t = Date.parse(v);
+      return isNaN(t) ? null : t;
+    } catch { return null; }
+  }
+
+  function setRefreshAck(iso) {
+    try {
+      if (iso) sessionStorage.setItem(REFRESH_ACK_KEY, iso);
+    } catch { /* private mode / quota */ }
   }
 
   // ---- Controls ---------------------------------------------------
@@ -246,11 +281,18 @@
 
     loadMoreBtn.addEventListener("click", () => { renderMore(); saveStateSoon(); });
 
-    if (refreshBanner) {
-      refreshBanner.addEventListener("click", async () => {
+    if (refreshAction) {
+      refreshAction.addEventListener("click", async () => {
         // Save state synchronously before reload so the user lands back where
         // they were (with the new data layered in).
         saveUiStateNow();
+        // Record that we're refreshing FOR this specific snapshot timestamp,
+        // so that a CDN propagation flap right after reload doesn't pop the
+        // banner up again immediately. After reload, loadData() will pick up
+        // either this snapshot (great, ack matches generatedAt) or a still-
+        // newer one (then ack is older than generatedAt, no banner — also fine).
+        const freshIso = refreshBanner && refreshBanner.dataset.freshIso;
+        if (freshIso) setRefreshAck(freshIso);
         // Reload safely w.r.t. the service worker.
         // The fetch we just did to detect the new snapshot also triggered the
         // SW to update its data cache. But there's a related risk: if a new
@@ -289,6 +331,18 @@
           // Fall through to simple reload.
         }
         location.reload();
+      });
+    }
+
+    if (refreshDismiss) {
+      refreshDismiss.addEventListener("click", () => {
+        // User explicitly dismissed the banner. Record the timestamp they
+        // just saw as ack'd so we don't re-prompt for the same snapshot,
+        // and hide the banner. Future scrapes (with newer generated_at)
+        // will still trigger it.
+        const freshIso = refreshBanner && refreshBanner.dataset.freshIso;
+        if (freshIso) setRefreshAck(freshIso);
+        if (refreshBanner) refreshBanner.hidden = true;
       });
     }
 
@@ -486,7 +540,9 @@
     return t < nowMs;
   }
 
-  // Search haystack: title + AI notes + category. Built lazily and cached.
+  // Search haystack: title + AI notes + category + description.
+  // Built lazily and cached on the item. Lowercased so we can do
+  // case-insensitive matching cheaply against the query regexes.
   function haystackOf(item) {
     if (item._hay === undefined) {
       const parts = [
@@ -498,6 +554,38 @@
       item._hay = parts.join(" \n ").toLowerCase();
     }
     return item._hay;
+  }
+
+  // Build search-term regexes from the user's query.
+  //
+  // We split on whitespace and require ALL terms to match (AND semantics, so
+  // "leaf blower" finds items mentioning both, in any order). Each term must
+  // appear at a WORD BOUNDARY in the haystack. That's the fix for the bug
+  // where searching "hat" returned every item whose AI notes contained
+  // "that" or "what".
+  //
+  // We use \b<term> (word-start), not \b<term>\b (whole-word), so that
+  // typing "hammer" still matches "hammers" / "hammered". The tradeoff:
+  // "saw" no longer matches inside "chainsaw" — typically what people want.
+  //
+  // Special chars in the query are escaped so a query like "3.5mm" doesn't
+  // get parsed as regex syntax.
+  function buildSearchTerms(query) {
+    if (!query) return null;
+    const terms = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+    if (terms.length === 0) return null;
+    return terms.map((t) => new RegExp("\\b" + escapeRegex(t)));
+  }
+  function escapeRegex(s) {
+    return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+  function matchesSearch(item, termRegexes) {
+    if (!termRegexes) return true;
+    const hay = haystackOf(item);
+    for (let i = 0; i < termRegexes.length; i++) {
+      if (!termRegexes[i].test(hay)) return false;
+    }
+    return true;
   }
 
   // ---- Sort comparators ------------------------------------------
@@ -547,14 +635,12 @@
     const showClosed   = showClosedCb.checked;
     const sortBy       = sortSel.value;
     const velocityMode = velocitySel.value;
-    const query        = searchQueryNorm;
+    const termRegexes  = buildSearchTerms(searchQueryNorm);
 
     filteredItems = allItems.filter((it) => {
       if (!showClosed && isClosed(it)) return false;
       if (!passesVelocityFilter(it, velocityMode)) return false;
-      if (query) {
-        if (haystackOf(it).indexOf(query) === -1) return false;
-      }
+      if (!matchesSearch(it, termRegexes)) return false;
       const f = flipScoreOf(it);
       if (isNaN(f)) return minFlip === 0;
       return f >= minFlip;
