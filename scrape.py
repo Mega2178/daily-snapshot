@@ -357,19 +357,24 @@ def do_enrich(items: dict[str, Item], limit: int | None = None) -> dict[str, Ite
 
 
 def compute_flip_score(it: Item) -> str:
-    """flip_score = (estimated_resale - current_bid - hassle) / current_bid
+    """flip_score = (estimated_resale - next_required_bid - hassle) / next_required_bid
 
+    Anchors on the price you'd actually pay (next required bid), not the
+    current top bid which would already be lost if you submitted only that.
     Returns a string. Empty if unknown / can't compute.
     """
     try:
         if it.ai_confidence in ("", "unknown"):
             return ""
         estimated_resale = float(it.ai_estimated_resale or 0)
-        bid = float(it.current_bid_value or 0)
+        # Prefer next_required_bid; fall back to current_bid + $1 if missing
+        next_bid_str = (it.next_required_bid or "").replace("$", "").replace(",", "").strip()
+        try:
+            bid = float(next_bid_str)
+        except ValueError:
+            bid = float(it.current_bid_value or 0) + 1.0
         if estimated_resale <= 0:
             return ""
-        # use $1 floor for bid so a $0.50 win doesn't produce divide-by-zero
-        # or absurd ratios
         bid_floor = max(bid, 1.0)
         score = (estimated_resale - bid - config.PICKUP_HASSLE_DOLLARS) / bid_floor
         return f"{score:.2f}"
