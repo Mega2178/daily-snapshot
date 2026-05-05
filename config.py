@@ -76,6 +76,31 @@ GEMINI_GIVEUP_AFTER_SECONDS = 90
 # Pickup hassle fudge factor (dollars subtracted when computing flip score)
 PICKUP_HASSLE_DOLLARS = 5.0
 
+# ─── PURCHASE PRICE MODEL ────────────────────────────────────────────────────
+# The auction-site "next required bid" is NOT the actual cost to acquire an
+# item. After buyer's premium, sales tax, and miscellaneous fees, the real
+# out-of-pocket cost is consistently ~30% higher than the winning bid. We
+# multiply next_required_bid by this factor everywhere we compute purchase
+# cost (flip_score, gross profit, ROI). Tune this if your local fees differ.
+PURCHASE_PRICE_MULTIPLIER = 1.3
+
+# ─── SALES VELOCITY MODEL ────────────────────────────────────────────────────
+# Gemini also estimates how quickly an item will sell on Facebook Marketplace
+# in the Kansas City metro. Tiers map to a numeric score so we can blend it
+# into a weighted "smart score" alongside ROI and gross profit.
+#
+# Don't read these as "days to sell" — Gemini doesn't actually know FB Marketplace
+# velocity data. Treat them as a rank: hot brand-name electronics rank high,
+# generic Amazon junk ranks low. Useful as ONE input among several, not as a
+# precise prediction.
+SALES_VELOCITY_SCORES = {
+    "hot": 1.0,        # name-brand electronics, tools, popular toys
+    "normal": 0.65,    # most household goods, name-brand kitchen items
+    "slow": 0.35,      # niche/specialty items, generic clothing, decor
+    "very_slow": 0.10, # generic Amazon-brand items, dated fashion, oddities
+    "unknown": 0.0,
+}
+
 # How many items to process when --test is passed. With BATCH_SIZE=25 the
 # default of 50 = exactly 2 Gemini batches, which is the smallest run that
 # still exercises the batch loop, checkpointing, and inter-batch pacing.
