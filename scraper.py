@@ -63,9 +63,11 @@ class Item:
     ai_confidence: str = ""
     ai_condition_severity: str = ""  # pristine/good/flawed/broken_or_unsellable
     ai_repairability: str = ""        # easy_cheap_fix/hard_expensive_fix/not_applicable
+    ai_sales_velocity: str = ""       # hot/normal/slow/very_slow/unknown
     value_overridden: str = ""        # "yes" if we forced resale to $0
     ai_notes: str = ""
-    flip_score: str = ""  # (estimated_resale - current_bid - hassle) / current_bid
+    flip_score: str = ""  # (estimated_resale - purchase_price - hassle) / purchase_price
+    gross_profit: str = ""  # estimated_resale - purchase_price - hassle (in dollars)
     scraped_at: str = ""
     enriched_at: str = ""
 
