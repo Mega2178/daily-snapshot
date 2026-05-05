@@ -4,8 +4,8 @@ AI enrichment via Gemini Flash-Lite.
 Strategy:
 - Batch ~25 items per API call.
 - Use structured output (response_schema) so we get reliable JSON back.
-- For each item, the model estimates current retail value, resale %, and
-  confidence. Items with confidence=unknown sink to bottom of CSV.
+- For each item, the model estimates current retail value, resale %, sales
+  velocity, and confidence. Items with confidence=unknown sink to bottom of CSV.
 - The model is told to IGNORE the seller-claimed "Retail: $X" string in the
   title because those numbers are routinely wrong by orders of magnitude.
 
@@ -51,6 +51,7 @@ class ItemValuation(BaseModel):
     product_identified: str = Field(description="Brief identification of what this product actually is, e.g. 'Sony WH-CH520 wireless headphones'")
     current_retail_usd: float = Field(description="Realistic CURRENT retail price NEW in USD (Amazon/Walmart 2026). 0 if unknown.")
     resale_pct: float = Field(description="Estimated resale value as % of retail in the Kansas City secondhand market (Facebook Marketplace / OfferUp). E.g. 0.55 means used items typically sell for 55% of retail. Use 0 if unknown.")
+    sales_velocity: str = Field(description="Estimated speed of selling on Facebook Marketplace in Kansas City metro. One of: hot, normal, slow, very_slow, unknown. See system instructions for criteria.")
     confidence: str = Field(description="One of: high, medium, low, unknown")
     condition_severity: str = Field(description="One of: pristine, good, flawed, broken_or_unsellable. Use 'broken_or_unsellable' for items where condition makes them worthless on resale market (missing critical parts, hygiene items, expired food, etc).")
     repairability: str = Field(description="If condition_severity is 'flawed' or 'broken_or_unsellable', one of: easy_cheap_fix (e.g. missing power cord, missing screws — under $20 to make sellable), hard_expensive_fix (e.g. missing battery for proprietary device, cracked screen), not_applicable (item has no fix issue). The cost benchmark: would the fix cost more than 30% of the resale value? If yes, hard_expensive_fix.")
@@ -85,7 +86,33 @@ For each item, fill in ALL fields:
      • Furniture: 0.25–0.45
      • Specialty/hobby (musical instruments, exercise equipment): 0.30–0.50
 
-3. CONFIDENCE — be honest:
+3. SALES_VELOCITY — how quickly this item is likely to sell on Facebook
+   Marketplace in the Kansas City metro at a fair price. This is NOT a precise
+   prediction, just a rank. Pick exactly one:
+     • "hot"       = high demand, name recognition, broadly useful. Sells in
+                     under a week. Examples: name-brand power tools (DeWalt,
+                     Milwaukee, Ryobi), gaming consoles, Apple/Sony
+                     electronics, baby gear, popular sneakers, ammo/firearms
+                     accessories, generators, snow blowers in season.
+     • "normal"    = steady demand. Sells in 1-3 weeks. Examples: most
+                     name-brand kitchen appliances, mid-tier electronics,
+                     bicycles, sporting goods, common furniture.
+     • "slow"      = niche, specialty, or commodity. Sells in 1-2 months.
+                     Examples: decor items, lamps, generic small appliances,
+                     office furniture, exercise equipment (large/heavy),
+                     unusual collectibles, kids' toys (non-trending).
+     • "very_slow" = generic, unbranded, or oversupplied. Often sits 2+ months
+                     or never sells. Examples: generic Amazon-brand junk,
+                     used-clothing single items, dated fashion, novelty items,
+                     niche hobby gear without a clear buyer, complicated
+                     items requiring assembly knowledge.
+     • "unknown"   = you genuinely cannot tell what category this is.
+
+   Adjust DOWN one tier if condition_severity is "flawed". Adjust DOWN two
+   tiers if condition_severity is "broken_or_unsellable". Seasonal items
+   (Christmas decor in May, AC units in November) should be one tier slower.
+
+4. CONFIDENCE — be honest:
      • "high"   = you know exactly what this product is and its real price
      • "medium" = you can identify the category and estimate within ±25%
      • "low"    = you have a rough guess but real value could be 2x off
@@ -93,7 +120,7 @@ For each item, fill in ALL fields:
    Use "unknown" liberally rather than fabricating. We'd rather have a missing
    row than a wrong row.
 
-4. CONDITION_SEVERITY — what's the physical state of THIS specific item
+5. CONDITION_SEVERITY — what's the physical state of THIS specific item
    (read the title and description carefully for damage notes):
      • "pristine"               = sealed, new, unopened
      • "good"                   = open box, lightly used, fully functional
@@ -107,7 +134,7 @@ For each item, fill in ALL fields:
                                   the buyer can't get, custom-engraved
                                   worthless-to-others items.
 
-5. REPAIRABILITY — only matters if condition_severity is "flawed" or
+6. REPAIRABILITY — only matters if condition_severity is "flawed" or
    "broken_or_unsellable". Pick exactly one:
      • "easy_cheap_fix"      = the fix is well under $20 and well under 30% of
                                resale value. Item is essentially saleable
@@ -136,7 +163,7 @@ For each item, fill in ALL fields:
    "missing the manual" or "no original box," that is NOT broken_or_unsellable.
    Cosmetic-only issues are "flawed" + "easy_cheap_fix" or "not_applicable".
 
-6. NOTES — 1–2 short sentences: identify what you think the item is, mention
+7. NOTES — 1–2 short sentences: identify what you think the item is, mention
    any specific fix needed and rough cost, or why you're uncertain.
 
 CONSISTENCY CHECK: The notes must agree with the structured fields. Do not
