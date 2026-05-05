@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Daily Snapshot</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="header-row">
+      <h1>Daily Snapshot</h1>
+      <div id="freshness" class="freshness freshness--unknown" aria-live="polite">
+        <span class="freshness-dot"></span>
+        <span id="freshness-text">Loading…</span>
+      </div>
+    </div>
+
+    <div class="controls">
+      <label class="control">
+        <span class="control-label">Sort</span>
+        <select id="sort">
+          <option value="flip_score">Flip score (high → low)</option>
+          <option value="current_bid">Current bid (low → high)</option>
+          <option value="closing_time">Closing time (soonest)</option>
+          <option value="title">Title (A → Z)</option>
+        </select>
+      </label>
+
+      <label class="control">
+        <span class="control-label">
+          Min flip score: <span id="min-flip-value">0.5</span>
+        </span>
+        <input id="min-flip" type="range" min="0" max="3" step="0.1" value="0.5">
+      </label>
+
+      <label class="control control--inline">
+        <input id="show-closed" type="checkbox">
+        <span>Show closed</span>
+      </label>
+
+      <div class="control-meta" id="result-count" aria-live="polite"></div>
+    </div>
+  </header>
+
+  <main id="grid" class="grid" aria-busy="true"></main>
+
+  <template id="card-template">
+    <article class="card" tabindex="0" role="link">
+      <div class="card-image">
+        <img alt="" loading="lazy" referrerpolicy="no-referrer">
+        <div class="card-image-fallback" aria-hidden="true">no image</div>
+      </div>
+      <div class="card-body">
+        <div class="card-top">
+          <span class="badge badge--score" data-role="flip-score">—</span>
+          <span class="badge badge--confidence" data-role="confidence"></span>
+        </div>
+        <h2 class="card-title" data-role="title"></h2>
+        <dl class="card-stats">
+          <div><dt>Bid</dt><dd data-role="bid"></dd></div>
+          <div><dt>Resale est.</dt><dd data-role="resale"></dd></div>
+          <div><dt>Retail est.</dt><dd data-role="retail"></dd></div>
+        </dl>
+        <div class="card-footer">
+          <span data-role="closing"></span>
+          <span class="card-category" data-role="category"></span>
+        </div>
+      </div>
+    </article>
+  </template>
+
+  <script src="app.js"></script>
+</body>
+</html>
