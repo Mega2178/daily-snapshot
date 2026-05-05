@@ -16,6 +16,8 @@
   --warn-soft: #f5ecd6;
   --bad: #a4322a;
   --bad-soft: #f4d9d6;
+  --info: #1f4477;
+  --info-soft: #e3ecf5;
   --shadow: 0 1px 2px rgba(0,0,0,0.04), 0 4px 12px rgba(0,0,0,0.04);
 
   --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
@@ -87,6 +89,98 @@ html, body {
 .freshness--ancient { background: var(--bad-soft);    border-color: #ecbeb9; color: var(--bad); }
 .freshness--ancient .freshness-dot { background: var(--bad); }
 
+/* ---------- Refresh banner --------------------------------------- */
+
+.refresh-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  margin: 0 0 10px;
+  padding: 10px 14px;
+  font: inherit;
+  font-size: 14px;
+  text-align: left;
+  background: linear-gradient(180deg, #1f4d3f 0%, #173a30 100%);
+  color: #fff;
+  border: 1px solid #173a30;
+  border-radius: 8px;
+  cursor: pointer;
+  box-shadow: 0 2px 6px rgba(31, 77, 63, 0.18);
+  transition: transform 0.08s ease, box-shadow 0.12s ease;
+}
+.refresh-banner:hover,
+.refresh-banner:focus-visible {
+  transform: translateY(-1px);
+  box-shadow: 0 3px 10px rgba(31, 77, 63, 0.25);
+  outline: none;
+}
+.refresh-banner__pulse {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #8fd9c0;
+  box-shadow: 0 0 0 0 rgba(143, 217, 192, 0.7);
+  animation: refresh-pulse 1.6s ease-out infinite;
+  flex-shrink: 0;
+}
+.refresh-banner__text { flex: 1; font-weight: 500; }
+.refresh-banner__action { font-weight: 600; opacity: 0.95; }
+
+@keyframes refresh-pulse {
+  0%   { box-shadow: 0 0 0 0 rgba(143, 217, 192, 0.7); }
+  70%  { box-shadow: 0 0 0 10px rgba(143, 217, 192, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(143, 217, 192, 0); }
+}
+
+/* ---------- Search row ------------------------------------------- */
+
+.search-row {
+  margin-bottom: 10px;
+}
+
+.search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  transition: border-color 0.12s ease, box-shadow 0.12s ease;
+}
+.search:focus-within {
+  border-color: #c8c3b6;
+  box-shadow: var(--shadow);
+}
+.search-icon {
+  color: var(--ink-faint);
+  font-size: 16px;
+  line-height: 1;
+}
+.search input[type="search"] {
+  flex: 1;
+  border: none;
+  outline: none;
+  background: transparent;
+  font: inherit;
+  padding: 4px 0;
+  /* hide native search-clear "X" — we render our own */
+  -webkit-appearance: none;
+}
+.search input[type="search"]::-webkit-search-cancel-button { display: none; }
+.search-clear {
+  border: none;
+  background: transparent;
+  color: var(--ink-faint);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 4px;
+  border-radius: 4px;
+}
+.search-clear:hover { color: var(--ink); }
+
 /* ---------- Controls --------------------------------------------- */
 
 .controls {
@@ -100,7 +194,7 @@ html, body {
   display: flex;
   flex-direction: column;
   gap: 4px;
-  min-width: 180px;
+  min-width: 160px;
 }
 .control--inline {
   flex-direction: row;
@@ -246,6 +340,41 @@ html, body {
   background: #efece4;
   color: var(--ink-faint);
   border-color: var(--rule);
+}
+.badge--profit {
+  background: var(--info-soft);
+  color: var(--info);
+  border: 1px solid #cfd9e6;
+}
+.badge--profit:empty { display: none; }
+.badge--velocity {
+  border: 1px solid var(--rule);
+  font-weight: 500;
+  text-transform: lowercase;
+  background: var(--surface);
+  color: var(--ink-muted);
+}
+.badge--velocity:empty { display: none; }
+.badge--velocity[data-velocity="hot"] {
+  background: #fbe9e3;
+  border-color: #f0c8b8;
+  color: #a4322a;
+}
+.badge--velocity[data-velocity="normal"] {
+  background: #f3eedd;
+  border-color: #ddd2a8;
+  color: #7a5a17;
+}
+.badge--velocity[data-velocity="slow"] {
+  background: #ece9e2;
+  border-color: var(--rule);
+  color: var(--ink-muted);
+}
+.badge--velocity[data-velocity="very_slow"] {
+  background: #ece9e2;
+  border-color: var(--rule);
+  color: var(--ink-faint);
+  text-decoration: line-through;
 }
 .badge--confidence {
   background: transparent;
