@@ -14,7 +14,7 @@
 // Bump CACHE_VERSION whenever you change app.js, index.html, or style.css
 // so old clients pick up the new code on next reload.
 
-const CACHE_VERSION = "v4";
+const CACHE_VERSION = "v5";
 const STATIC_CACHE  = `static-${CACHE_VERSION}`;
 const DATA_CACHE    = `data-${CACHE_VERSION}`;
 
@@ -30,7 +30,26 @@ const STATIC_ASSETS = [
 // ---- install: pre-cache the static shell ----------------------
 self.addEventListener("install", (event) => {
   event.waitUntil(
-    caches.open(STATIC_CACHE).then((cache) => cache.addAll(STATIC_ASSETS))
+    caches.open(STATIC_CACHE).then((cache) => {
+      // CRITICAL: use {cache: "reload"} so the precache fetch BYPASSES the
+      // browser's HTTP cache and goes to the network. Without this, when a
+      // new SW version installs, it can pull stale copies of index.html /
+      // app.js / style.css from the HTTP cache (which still has the old
+      // versions) and store those into the new SW cache. Result: the user
+      // sees old code on the next reload even though the SW version was
+      // bumped. cache:"reload" forces a fresh GET for each asset.
+      return Promise.all(
+        STATIC_ASSETS.map((url) =>
+          fetch(new Request(url, { cache: "reload" }))
+            .then((res) => {
+              if (!res || !res.ok) {
+                throw new Error(`precache failed for ${url}: HTTP ${res && res.status}`);
+              }
+              return cache.put(url, res);
+            })
+        )
+      );
+    })
   );
   // Activate this SW immediately on first install.
   self.skipWaiting();
@@ -48,6 +67,16 @@ self.addEventListener("activate", (event) => {
     )
   );
   self.clients.claim();
+});
+
+// ---- message: SKIP_WAITING handler -----------------------------
+// The page (app.js refresh handler) sends this when the user clicks the
+// "New snapshot available — Refresh" banner AND a new SW version is waiting.
+// We promote the waiting worker so it takes control on the next reload.
+self.addEventListener("message", (event) => {
+  if (event.data && event.data.type === "SKIP_WAITING") {
+    self.skipWaiting();
+  }
 });
 
 // ---- fetch: route by URL ---------------------------------------
