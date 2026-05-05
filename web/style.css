@@ -272,11 +272,11 @@ html, body {
 .card-stats {
   margin: 4px 0 0;
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(4, 1fr);
   gap: 6px 8px;
   font-size: 12px;
 }
-.card-stats > div { display: flex; flex-direction: column; }
+.card-stats > div { display: flex; flex-direction: column; min-width: 0; }
 .card-stats dt {
   margin: 0;
   color: var(--ink-faint);
@@ -289,6 +289,9 @@ html, body {
   font-family: var(--font-mono);
   font-size: 13px;
   color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .card-footer {
@@ -315,6 +318,37 @@ html, body {
   max-width: 50%;
 }
 
+/* ---------- Load more -------------------------------------------- */
+
+.load-more-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 20px 32px;
+}
+.load-more-btn {
+  font: inherit;
+  font-weight: 500;
+  padding: 10px 18px;
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--ink);
+  cursor: pointer;
+  transition: border-color 0.12s ease, box-shadow 0.12s ease;
+}
+.load-more-btn:hover,
+.load-more-btn:focus-visible {
+  border-color: #c8c3b6;
+  box-shadow: var(--shadow);
+  outline: none;
+}
+.load-more-info {
+  font-size: 12px;
+  color: var(--ink-muted);
+}
+
 /* ---------- Mobile (Chromebook 380-ish viewport) ----------------- */
 
 @media (max-width: 480px) {
@@ -328,4 +362,6 @@ html, body {
     gap: 12px;
     padding: 14px;
   }
+  /* On phones, drop to 2x2 stat grid instead of cramming 4 across */
+  .card-stats { grid-template-columns: repeat(2, 1fr); }
 }
