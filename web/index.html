@@ -17,11 +17,14 @@
     </div>
 
     <!-- Refresh banner — appears when a newer items.json is detected -->
-    <button id="refresh-banner" class="refresh-banner" type="button" hidden>
-      <span class="refresh-banner__pulse" aria-hidden="true"></span>
-      <span class="refresh-banner__text">New snapshot available</span>
-      <span class="refresh-banner__action">Refresh →</span>
-    </button>
+    <div id="refresh-banner" class="refresh-banner" hidden>
+      <button id="refresh-banner-action" class="refresh-banner__main" type="button">
+        <span class="refresh-banner__pulse" aria-hidden="true"></span>
+        <span class="refresh-banner__text">New snapshot available</span>
+        <span class="refresh-banner__cta">Refresh →</span>
+      </button>
+      <button id="refresh-banner-dismiss" class="refresh-banner__dismiss" type="button" aria-label="Dismiss">×</button>
+    </div>
 
     <!-- Search bar -->
     <div class="search-row">
