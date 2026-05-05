@@ -48,15 +48,17 @@ def _set_test_paths() -> None:
     JSON_PATH = JSON_PATH_TEST
 
 CSV_FIELDS = [
-    "flip_score",            # most important — sorted by this
+    "flip_score",            # ROI: most important — sorted by this
+    "gross_profit",          # absolute $ profit
     "current_bid",
     "ai_estimated_resale",
     "ai_retail_estimate",
     "ai_resale_pct",
     "ai_confidence",
-    "ai_condition_severity",   # NEW: pristine / good / flawed / broken_or_unsellable
-    "ai_repairability",        # NEW: easy_cheap_fix / hard_expensive_fix / not_applicable
-    "value_overridden",        # NEW: "yes" if we forced resale to $0
+    "ai_sales_velocity",     # hot / normal / slow / very_slow / unknown
+    "ai_condition_severity", # pristine / good / flawed / broken_or_unsellable
+    "ai_repairability",      # easy_cheap_fix / hard_expensive_fix / not_applicable
+    "value_overridden",      # "yes" if we forced resale to $0
     "title",
     "ai_notes",
     "category",
@@ -323,6 +325,7 @@ def do_enrich(items: dict[str, Item], limit: int | None = None) -> dict[str, Ite
             it.ai_confidence = v.confidence
             it.ai_condition_severity = v.condition_severity
             it.ai_repairability = v.repairability
+            it.ai_sales_velocity = v.sales_velocity
 
             # ── Deterministic override for unsellable items ──
             # The model commits to structured fields (condition_severity +
@@ -341,8 +344,9 @@ def do_enrich(items: dict[str, Item], limit: int | None = None) -> dict[str, Ite
             it.ai_estimated_resale = f"{estimated_resale:.2f}"
             it.ai_notes = f"[{v.product_identified}] {v.notes}".strip()
             it.enriched_at = now_iso
-            # compute flip_score
+            # compute flip_score (ROI) and gross_profit ($)
             it.flip_score = compute_flip_score(it)
+            it.gross_profit = compute_gross_profit(it)
 
         # checkpoint after each batch
         save_raw(items)
@@ -356,39 +360,80 @@ def do_enrich(items: dict[str, Item], limit: int | None = None) -> dict[str, Ite
     return items
 
 
-def compute_flip_score(it: Item) -> str:
-    """flip_score = (estimated_resale - next_required_bid - hassle) / next_required_bid
+def _purchase_price(it: Item) -> float | None:
+    """The realistic out-of-pocket cost to acquire this item.
 
-    Anchors on the price you'd actually pay (next required bid), not the
-    current top bid which would already be lost if you submitted only that.
+    next_required_bid * PURCHASE_PRICE_MULTIPLIER, where the multiplier
+    accounts for buyer's premium, sales tax, and assorted fees on top of
+    the winning bid. Returns None if we can't parse a bid.
+    """
+    next_bid_str = (it.next_required_bid or "").replace("$", "").replace(",", "").strip()
+    try:
+        bid = float(next_bid_str)
+    except ValueError:
+        try:
+            bid = float(it.current_bid_value or 0) + 1.0
+        except (ValueError, TypeError):
+            return None
+    if bid <= 0:
+        return None
+    return bid * config.PURCHASE_PRICE_MULTIPLIER
+
+
+def compute_flip_score(it: Item) -> str:
+    """flip_score (ROI) = (estimated_resale - purchase_price - hassle) / purchase_price
+
+    purchase_price = next_required_bid * PURCHASE_PRICE_MULTIPLIER, which models
+    buyer's premium + tax + fees. The bid alone underestimates real cost by
+    roughly 30%.
+
     Returns a string. Empty if unknown / can't compute.
     """
     try:
         if it.ai_confidence in ("", "unknown"):
             return ""
         estimated_resale = float(it.ai_estimated_resale or 0)
-        # Prefer next_required_bid; fall back to current_bid + $1 if missing
-        next_bid_str = (it.next_required_bid or "").replace("$", "").replace(",", "").strip()
-        try:
-            bid = float(next_bid_str)
-        except ValueError:
-            bid = float(it.current_bid_value or 0) + 1.0
         if estimated_resale <= 0:
             return ""
-        bid_floor = max(bid, 1.0)
-        score = (estimated_resale - bid - config.PICKUP_HASSLE_DOLLARS) / bid_floor
+        purchase_price = _purchase_price(it)
+        if purchase_price is None:
+            return ""
+        bid_floor = max(purchase_price, 1.0)
+        score = (estimated_resale - purchase_price - config.PICKUP_HASSLE_DOLLARS) / bid_floor
         return f"{score:.2f}"
     except (ValueError, TypeError):
         return ""
 
 
+def compute_gross_profit(it: Item) -> str:
+    """Absolute dollar profit: estimated_resale - purchase_price - hassle.
+
+    Same purchase-price model as flip_score (next_bid * 1.3).
+    Returns a string. Empty if unknown / can't compute.
+    """
+    try:
+        if it.ai_confidence in ("", "unknown"):
+            return ""
+        estimated_resale = float(it.ai_estimated_resale or 0)
+        if estimated_resale <= 0:
+            return ""
+        purchase_price = _purchase_price(it)
+        if purchase_price is None:
+            return ""
+        profit = estimated_resale - purchase_price - config.PICKUP_HASSLE_DOLLARS
+        return f"{profit:.2f}"
+    except (ValueError, TypeError):
+        return ""
+
+
 def recompute_all_flip_scores(items: dict[str, Item]) -> None:
-    """Recompute flip_score for every item — useful when bids changed but
-    AI data didn't.
+    """Recompute flip_score AND gross_profit for every item — useful when
+    bids changed but AI data didn't.
     """
     for it in items.values():
         if it.ai_confidence and it.ai_confidence != "unknown":
             it.flip_score = compute_flip_score(it)
+            it.gross_profit = compute_gross_profit(it)
 
 
 # ────────────────────────────── main ────────────────────────────────────────
