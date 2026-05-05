@@ -16,11 +16,36 @@
       </div>
     </div>
 
+    <!-- Refresh banner — appears when a newer items.json is detected -->
+    <button id="refresh-banner" class="refresh-banner" type="button" hidden>
+      <span class="refresh-banner__pulse" aria-hidden="true"></span>
+      <span class="refresh-banner__text">New snapshot available</span>
+      <span class="refresh-banner__action">Refresh →</span>
+    </button>
+
+    <!-- Search bar -->
+    <div class="search-row">
+      <label class="search">
+        <span class="search-icon" aria-hidden="true">⌕</span>
+        <input
+          id="search"
+          type="search"
+          placeholder="Search title, notes, category…"
+          autocomplete="off"
+          spellcheck="false"
+          aria-label="Search items"
+        >
+        <button id="search-clear" type="button" class="search-clear" aria-label="Clear search" hidden>×</button>
+      </label>
+    </div>
+
     <div class="controls">
       <label class="control">
         <span class="control-label">Sort</span>
         <select id="sort">
-          <option value="flip_score">Flip score (high → low)</option>
+          <option value="smart">Smart score (ROI × profit × velocity)</option>
+          <option value="flip_score">ROI / flip score (high → low)</option>
+          <option value="gross_profit">Gross profit (high → low)</option>
           <option value="current_bid">Next required bid (low → high)</option>
           <option value="closing_time">Closing time (soonest)</option>
           <option value="title">Title (A → Z)</option>
@@ -28,8 +53,18 @@
       </label>
 
       <label class="control">
+        <span class="control-label">Velocity</span>
+        <select id="velocity">
+          <option value="any">Any</option>
+          <option value="hot">Hot only</option>
+          <option value="hot_or_normal">Hot or normal</option>
+          <option value="exclude_very_slow">Exclude very slow</option>
+        </select>
+      </label>
+
+      <label class="control">
         <span class="control-label">
-          Min flip score: <span id="min-flip-value">0.5</span>
+          Min ROI: <span id="min-flip-value">0.5</span>×
         </span>
         <input id="min-flip" type="range" min="0" max="3" step="0.1" value="0.5">
       </label>
@@ -59,12 +94,14 @@
       <div class="card-body">
         <div class="card-top">
           <span class="badge badge--score" data-role="flip-score">—</span>
+          <span class="badge badge--profit" data-role="gross-profit"></span>
+          <span class="badge badge--velocity" data-role="velocity"></span>
           <span class="badge badge--confidence" data-role="confidence"></span>
         </div>
         <h2 class="card-title" data-role="title"></h2>
         <dl class="card-stats">
           <div><dt>Bid</dt><dd data-role="bid"></dd></div>
-          <div><dt>Next bid</dt><dd data-role="next-bid"></dd></div>
+          <div><dt>Cost (×1.3)</dt><dd data-role="purchase-price"></dd></div>
           <div><dt>Resale est.</dt><dd data-role="resale"></dd></div>
           <div><dt>Retail est.</dt><dd data-role="retail"></dd></div>
         </dl>
