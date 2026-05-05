@@ -1,20 +1,20 @@
 // Daily Snapshot service worker.
 // ---------------------------------------------------------------
-// Goal: make repeat visits feel instant, without showing stale data
-// for so long that the user wonders why nothing has changed.
+// Goal: make repeat visits feel instant, AND always show fresh data.
 //
 // Strategy:
 //   - HTML / CSS / JS / fonts:  cache-first.   Fastest possible paint.
-//   - data/items.json:          stale-while-revalidate.
-//                               Serve cached copy immediately AND fetch a
-//                               fresh one in the background; next reload
-//                               picks up the new data.
+//   - data/items.json:          network-first.
+//                               Always try GitHub Pages for the latest
+//                               copy on every load. If the network is
+//                               down, serve last-known cached copy as
+//                               an offline fallback.
 //   - Everything else (CDN images): just hit the network normally.
 //
 // Bump CACHE_VERSION whenever you change app.js, index.html, or style.css
 // so old clients pick up the new code on next reload.
 
-const CACHE_VERSION = "v2";
+const CACHE_VERSION = "v3";
 const STATIC_CACHE  = `static-${CACHE_VERSION}`;
 const DATA_CACHE    = `data-${CACHE_VERSION}`;
 
@@ -59,9 +59,9 @@ self.addEventListener("fetch", (event) => {
   const url = new URL(req.url);
   if (url.origin !== self.location.origin) return;
 
-  // The data file: stale-while-revalidate.
+  // The data file: network-first so we always pick up fresh scrape results.
   if (url.pathname.endsWith("/data/items.json")) {
-    event.respondWith(staleWhileRevalidate(req, DATA_CACHE));
+    event.respondWith(networkFirst(req, DATA_CACHE));
     return;
   }
 
@@ -94,23 +94,17 @@ async function cacheFirst(request, cacheName) {
   }
 }
 
-// Stale-while-revalidate: hand back the cached copy immediately, kick off
-// a background refresh that updates the cache for next time.
-async function staleWhileRevalidate(request, cacheName) {
-  const cache  = await caches.open(cacheName);
-  const cached = await cache.match(request);
-
-  const networkPromise = fetch(request)
-    .then((fresh) => {
-      if (fresh && fresh.ok) cache.put(request, fresh.clone());
-      return fresh;
-    })
-    .catch(() => null); // background failure is non-fatal
-
-  // If we have a cached copy, return it now and let the network update happen
-  // in the background. Otherwise wait on the network.
-  return cached || (await networkPromise) || new Response(
-    JSON.stringify({ generated_at: null, items: [] }),
-    { headers: { "Content-Type": "application/json" } }
-  );
+// Network-first: try the network; if it works, cache for offline fallback.
+// If the network fails (offline / GitHub Pages hiccup), serve last cached copy.
+async function networkFirst(request, cacheName) {
+  const cache = await caches.open(cacheName);
+  try {
+    const fresh = await fetch(request);
+    if (fresh && fresh.ok) cache.put(request, fresh.clone());
+    return fresh;
+  } catch (err) {
+    const cached = await cache.match(request);
+    if (cached) return cached;
+    throw err;
+  }
 }
