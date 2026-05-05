@@ -61,7 +61,7 @@
       // No {cache:"no-store"} — we WANT the browser/SW to be allowed to serve
       // a cached copy. The SW uses stale-while-revalidate, so a cached items.json
       // shows up immediately and a fresh copy is fetched in the background.
-      const res = await fetch("data/items.json");
+      const res = await fetch("data/items.json", { cache: "no-cache" });
       if (!res.ok) throw new Error("HTTP " + res.status);
       const data = await res.json();
       allItems    = Array.isArray(data.items) ? data.items : [];
