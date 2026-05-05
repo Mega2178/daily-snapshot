@@ -21,7 +21,7 @@
         <span class="control-label">Sort</span>
         <select id="sort">
           <option value="flip_score">Flip score (high → low)</option>
-          <option value="current_bid">Current bid (low → high)</option>
+          <option value="current_bid">Next required bid (low → high)</option>
           <option value="closing_time">Closing time (soonest)</option>
           <option value="title">Title (A → Z)</option>
         </select>
@@ -45,6 +45,11 @@
 
   <main id="grid" class="grid" aria-busy="true"></main>
 
+  <div id="load-more-wrap" class="load-more-wrap" hidden>
+    <button id="load-more" type="button" class="load-more-btn">Load more</button>
+    <span id="load-more-info" class="load-more-info"></span>
+  </div>
+
   <template id="card-template">
     <article class="card" tabindex="0" role="link">
       <div class="card-image">
@@ -59,6 +64,7 @@
         <h2 class="card-title" data-role="title"></h2>
         <dl class="card-stats">
           <div><dt>Bid</dt><dd data-role="bid"></dd></div>
+          <div><dt>Next bid</dt><dd data-role="next-bid"></dd></div>
           <div><dt>Resale est.</dt><dd data-role="resale"></dd></div>
           <div><dt>Retail est.</dt><dd data-role="retail"></dd></div>
         </dl>
