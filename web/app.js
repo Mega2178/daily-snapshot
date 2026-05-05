@@ -161,6 +161,10 @@
 
   async function checkForNewSnapshot() {
     if (refreshBanner && !refreshBanner.hidden) return; // banner already up
+    // If the initial loadData() hasn't finished yet, generatedAt is null and
+    // we have nothing to compare against. Bail — we'll re-check on the next
+    // interval / visibilitychange after data is loaded.
+    if (!generatedAt) return;
     try {
       // Use {cache:"no-store"} here so we explicitly bypass HTTP caches —
       // we want to know if the server has a NEWER copy than what we loaded.
@@ -169,8 +173,9 @@
       if (!res.ok) return;
       const data = await res.json();
       const fresh = data.generated_at ? new Date(data.generated_at) : null;
-      if (!fresh) return;
-      if (!generatedAt || fresh.getTime() > generatedAt.getTime()) {
+      if (!fresh || isNaN(fresh.getTime())) return;
+      // Strictly newer — equal timestamps mean same snapshot, no banner.
+      if (fresh.getTime() > generatedAt.getTime()) {
         showRefreshBanner();
       }
     } catch (err) {
@@ -242,10 +247,47 @@
     loadMoreBtn.addEventListener("click", () => { renderMore(); saveStateSoon(); });
 
     if (refreshBanner) {
-      refreshBanner.addEventListener("click", () => {
+      refreshBanner.addEventListener("click", async () => {
         // Save state synchronously before reload so the user lands back where
         // they were (with the new data layered in).
         saveUiStateNow();
+        // Reload safely w.r.t. the service worker.
+        // The fetch we just did to detect the new snapshot also triggered the
+        // SW to update its data cache. But there's a related risk: if a new
+        // VERSION of the SW itself is waiting to activate (because we shipped
+        // new app.js / index.html / style.css), a plain location.reload()
+        // might still hit the OLD SW and get OLD cached assets. To avoid this:
+        //   1. Ask the SW registration to update.
+        //   2. If a new worker is found, send it skipWaiting and wait for it
+        //      to take control, then reload.
+        //   3. Otherwise, just reload.
+        // Worst case we fall through to the simple reload, which is still
+        // correct — just might serve cached items.json on a brief network hiccup.
+        try {
+          if ("serviceWorker" in navigator && navigator.serviceWorker.controller) {
+            const reg = await navigator.serviceWorker.getRegistration();
+            if (reg) {
+              await reg.update();   // pull latest sw.js from network
+              const waiting = reg.waiting;
+              if (waiting) {
+                // A new SW is waiting — promote it and reload AFTER it takes over.
+                let reloaded = false;
+                navigator.serviceWorker.addEventListener("controllerchange", () => {
+                  if (reloaded) return;
+                  reloaded = true;
+                  location.reload();
+                });
+                waiting.postMessage({ type: "SKIP_WAITING" });
+                // Safety net: if controllerchange doesn't fire within 2s
+                // (some browsers / edge cases), just reload anyway.
+                setTimeout(() => { if (!reloaded) location.reload(); }, 2000);
+                return;
+              }
+            }
+          }
+        } catch (err) {
+          // Fall through to simple reload.
+        }
         location.reload();
       });
     }
