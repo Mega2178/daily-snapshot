@@ -5,7 +5,7 @@ on:
     # Every 2 hours on the hour (UTC). Bids on Equip-Bid climb during the
     # day, so we re-scrape often; enrichment is per-item cached so this
     # only burns Gemini quota on genuinely new lots.
-    - cron: '0 */2 * * *'
+    - cron: '23 */2 * * *'
   workflow_dispatch:
 
 permissions:
