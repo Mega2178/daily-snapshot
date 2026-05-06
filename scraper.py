@@ -56,6 +56,7 @@ class Item:
     description: str = ""
     additional_detail: str = ""
     title_retail_claim: str = ""  # the "Retail: $X" the seller put in the title
+    location: str = ""  # "City, ST" — pulled from the auction-list page panel
     # AI enrichment fields (filled later)
     ai_retail_estimate: str = ""
     ai_resale_pct: str = ""
@@ -63,6 +64,7 @@ class Item:
     ai_confidence: str = ""
     ai_condition_severity: str = ""  # pristine/good/flawed/broken_or_unsellable
     ai_repairability: str = ""        # easy_cheap_fix/hard_expensive_fix/not_applicable
+    ai_repair_cost_usd: str = ""      # model's $ estimate to make item sellable (aftermarket/used parts OK)
     ai_sales_velocity: str = ""       # hot/normal/slow/very_slow/unknown
     value_overridden: str = ""        # "yes" if we forced resale to $0
     ai_notes: str = ""
@@ -490,9 +492,131 @@ def parse_items_on_page(html: str) -> list[Item]:
 
 # ────────────────────────────── crawl driver ────────────────────────────────
 
-def crawl_auction_house(session: Session, house_url: str) -> Iterator[Item]:
-    """Yield every item from every page of one auction house."""
-    print(f"\n→ {house_url}")
+# "City, ST" or "City, ST 64081" — anywhere on an auction-house page header.
+# Equip-Bid puts the location near the auction title; the exact element
+# varies (sometimes a <p> under the <h1>, sometimes a <span> with no class).
+# We bias toward strings that look like real US city/state pairs and pick
+# the first one on the page.
+#
+# City/state lives on the auction LIST page (the page we already fetch in
+# crawl_all), inside each auction's panel. Format is dependable:
+#
+#   <div class="panel panel-default">
+#       ...
+#       <a href="/auction/45988">…title…</a>
+#       <div><i class="bi-globe-americas kb-icon"…></i>STREET, CITY, ST ZIP</div>
+#       ...
+#   </div>
+#
+# So instead of fetching each house page separately and regex-scanning prose,
+# we walk the panels on the list page once, build a {house_url -> "City, ST"}
+# map, and pass it down. One parse, perfectly structured input.
+
+# "ST ZIP" or "ST ZIP-EXT" — the state-and-zip suffix on the address line.
+# Anchored to end of string so we don't accidentally match "MO" inside the
+# street name (e.g. "Mound City").
+_STATE_ZIP_RE = re.compile(r"\b([A-Z]{2})\s+\d{5}(?:-\d{4})?\s*$")
+
+# Just "ST" at end of string — fallback when the ZIP is missing.
+_STATE_ONLY_RE = re.compile(r",\s*([A-Z]{2})\s*$")
+
+
+def _parse_address_line(text: str) -> str:
+    """Pull 'City, ST' out of one Equip-Bid address string.
+
+    Inputs we've seen in the wild (from the auction list page):
+      '1120 SW 28TH Street, Blue Springs, MO 64015'
+      '4545 Emanuel Cleaver II Blvd, Kansas City, MO 64130'
+      'Washington and Kellogg, Wichita, KS 67211'
+      'Overland Park, KS 66213'                   (no street)
+      "Lee's Summit, MO"                          (no zip)
+
+    Strategy: find the trailing 'ST ZIP' (or just 'ST') to anchor the state,
+    then take the comma-separated chunk immediately before it as the city.
+    Returns '' if we can't identify a state — better to skip than to guess.
+    """
+    if not text:
+        return ""
+    text = text.strip()
+
+    # Find the state. Prefer the ST-ZIP form; fall back to bare ST.
+    state = ""
+    text_for_split = text
+    m = _STATE_ZIP_RE.search(text)
+    if m:
+        state = m.group(1)
+        # Strip the ST-ZIP off so the remaining text ends at the city.
+        text_for_split = text[:m.start()].rstrip(", ").rstrip()
+    else:
+        m = _STATE_ONLY_RE.search(text)
+        if m:
+            state = m.group(1)
+            text_for_split = text[:m.start()].rstrip(", ").rstrip()
+
+    if not state:
+        return ""
+
+    # The city is the last comma-separated chunk in what remains.
+    parts = [p.strip() for p in text_for_split.split(",") if p.strip()]
+    if not parts:
+        return ""
+    city = parts[-1]
+    if len(city) < 2:
+        return ""
+    return f"{city}, {state}"
+
+
+def parse_house_locations(list_html: str) -> dict[str, str]:
+    """From the auction-list page, build {house_url -> 'City, ST'}.
+
+    Walks each `<div class="panel panel-default">` (one per auction), finds
+    the auction URL inside it (any `/auction/N` link, ignoring `/item/`
+    sub-links), and finds the location line — the parent of the
+    `<i class="bi-globe-americas">` icon.
+    """
+    soup = BeautifulSoup(list_html, "html.parser")
+    out: dict[str, str] = {}
+
+    for panel in soup.select("div.panel.panel-default"):
+        # Find the auction URL. The same href appears in several places
+        # inside the panel (View Auction button, title link, item-count
+        # link). Take the first /auction/N link that isn't a deep-link
+        # to /item/.
+        house_url = ""
+        for a in panel.select("a[href]"):
+            href = a.get("href", "")
+            m = AUCTION_ID_RE.search(urlparse(urljoin(BASE_URL, href)).path)
+            if m and "/item/" not in href:
+                house_url = urljoin(BASE_URL, f"/auction/{m.group(1)}")
+                break
+        if not house_url:
+            continue
+
+        # Find the location line via the globe icon. Its parent <div>
+        # contains the icon + the raw address text node.
+        loc_text = ""
+        icon = panel.select_one("i.bi-globe-americas")
+        if icon and icon.parent:
+            loc_text = icon.parent.get_text(" ", strip=True)
+
+        location = _parse_address_line(loc_text)
+        if location:
+            out[house_url] = location
+
+    return out
+
+
+def crawl_auction_house(
+    session: Session, house_url: str, location: str = ""
+) -> Iterator[Item]:
+    """Yield every item from every page of one auction house.
+
+    `location` is the pre-extracted 'City, ST' for this house (passed in
+    from crawl_all so we don't have to re-parse it on every house page).
+    Empty string is fine — items from a house with no resolved location
+    just don't get a location stamped on them.
+    """
+    print(f"\n→ {house_url}" + (f"  ({location})" if location else ""))
     try:
         html = session.get(house_url)
     except Exception as e:
@@ -503,6 +627,8 @@ def crawl_auction_house(session: Session, house_url: str) -> Iterator[Item]:
     items = parse_items_on_page(html)
     print(f"  page 1/{max_page}: {len(items)} items")
     for it in items:
+        if location:
+            it.location = location
         yield it
 
     for page in range(2, max_page + 1):
@@ -516,6 +642,8 @@ def crawl_auction_house(session: Session, house_url: str) -> Iterator[Item]:
         items = parse_items_on_page(page_html)
         print(f"  page {page}/{max_page}: {len(items)} items")
         for it in items:
+            if location:
+                it.location = location
             yield it
 
 
@@ -527,7 +655,9 @@ def crawl_all(session: Session | None = None) -> Iterator[Item]:
     print(f"Auction list: {list_url}")
     list_html = session.get(list_url)
     houses = parse_auction_houses(list_html)
-    print(f"Found {len(houses)} auction houses")
+    locations = parse_house_locations(list_html)
+    resolved = sum(1 for h in houses if h in locations)
+    print(f"Found {len(houses)} auction houses ({resolved} with location)")
 
     for h in houses:
-        yield from crawl_auction_house(session, h)
+        yield from crawl_auction_house(session, h, location=locations.get(h, ""))
