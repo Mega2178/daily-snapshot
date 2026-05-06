@@ -53,9 +53,10 @@ class ItemValuation(BaseModel):
     resale_pct: float = Field(description="Estimated resale value as % of retail in the Kansas City secondhand market (Facebook Marketplace / OfferUp). E.g. 0.55 means used items typically sell for 55% of retail. Use 0 if unknown.")
     sales_velocity: str = Field(description="Estimated speed of selling on Facebook Marketplace in Kansas City metro. One of: hot, normal, slow, very_slow, unknown. See system instructions for criteria.")
     confidence: str = Field(description="One of: high, medium, low, unknown")
-    condition_severity: str = Field(description="One of: pristine, good, flawed, broken_or_unsellable. Use 'broken_or_unsellable' for items where condition makes them worthless on resale market (missing critical parts, hygiene items, expired food, etc).")
-    repairability: str = Field(description="If condition_severity is 'flawed' or 'broken_or_unsellable', one of: easy_cheap_fix (e.g. missing power cord, missing screws — under $20 to make sellable), hard_expensive_fix (e.g. missing battery for proprietary device, cracked screen), not_applicable (item has no fix issue). The cost benchmark: would the fix cost more than 30% of the resale value? If yes, hard_expensive_fix.")
-    notes: str = Field(description="Brief caveat or reasoning (1-2 sentences max). Mention the specific fix needed if relevant.")
+    condition_severity: str = Field(description="One of: pristine, good, flawed, broken_or_unsellable. Use 'broken_or_unsellable' for items where condition makes them worthless on resale market (missing critical parts, hygiene items, expired food, etc). DO NOT mark as broken_or_unsellable if the listing only says condition is unknown — assume it works unless damage is explicitly stated.")
+    repairability: str = Field(description="If condition_severity is 'flawed' or 'broken_or_unsellable', one of: easy_cheap_fix (e.g. missing power cord, missing screws — under $20 to make sellable, considering aftermarket/used/junkyard parts), hard_expensive_fix (e.g. missing proprietary battery, cracked screen), not_applicable (item has no fix issue). The cost benchmark: would the fix cost more than 30% of the resale value? If yes, hard_expensive_fix.")
+    repair_cost_usd: float = Field(description="Realistic $ to make this item sellable — using AFTERMARKET / used / generic / junkyard parts when applicable, NOT OEM list price. Examples: missing power cable → 10. Missing car bumper → 60 (junkyard). Cracked phone screen on $200 used phone → 80. Missing proprietary drone battery → 120. Use 0 if no repair is needed (pristine/good) OR if you set condition_severity=broken_or_unsellable and repairability=hard_expensive_fix (since we'll force resale to $0 in that case).")
+    notes: str = Field(description="Brief caveat or reasoning (1-2 sentences max). Mention the specific fix needed and its rough cost if relevant.")
 
 
 class BatchResponse(BaseModel):
@@ -134,26 +135,58 @@ For each item, fill in ALL fields:
                                   the buyer can't get, custom-engraved
                                   worthless-to-others items.
 
+   IMPORTANT: if the listing only says the condition is "unknown" or
+   "untested" or just doesn't mention the working state at all, ASSUME the
+   item is "good" (functional). Do NOT default to broken_or_unsellable
+   without explicit damage language. Auctioneers leave most items
+   un-tested but the items still usually work fine.
+
 6. REPAIRABILITY — only matters if condition_severity is "flawed" or
-   "broken_or_unsellable". Pick exactly one:
-     • "easy_cheap_fix"      = the fix is well under $20 and well under 30% of
-                               resale value. Item is essentially saleable
-                               with minor work.
-                               Examples: missing standard USB-C cable,
-                               missing wall power adapter (universal),
-                               missing screws (hardware store), needs
-                               cleaning, needs new generic remote control,
-                               missing manual.
-     • "hard_expensive_fix"  = the fix is expensive, hard to source, or
-                               costs more than 30% of resale value.
-                               Examples: missing proprietary battery
-                               (e-bike, drone, tool battery), cracked
-                               LCD screen, missing cartridge/proprietary
-                               accessory, water damage, electrical
-                               malfunction, missing key for lock,
-                               missing tank/component sold separately.
-     • "not_applicable"      = item has no condition issue worth fixing
-                               (i.e. condition is pristine or good).
+   "broken_or_unsellable". The buyer of these items has the help of a
+   competent handyman who can do basic mechanical work, basic cosmetic work
+   (replacing dented body panels, swapping headlight assemblies, replacing
+   broken glass), and basic non-risky electrical work (replacing fuses,
+   wiring outlets, swapping switches). They have a normal toolkit and can
+   source parts from a hardware store, AutoZone, junkyard, eBay, Amazon,
+   or Facebook Marketplace. Assume aftermarket / used / generic / junkyard
+   sources when costing the fix — most flippers don't pay OEM list price.
+
+   What COUNTS as easy_cheap_fix (handyman + cheap parts can handle it):
+     • Missing standard cable (USB-C, HDMI, AC) — under $15
+     • Missing universal power adapter — under $20
+     • Missing screws, knobs, or hardware-store parts
+     • Needs cleaning or replacement gaskets
+     • Missing generic remote control
+     • Missing manual (PDF available online — $0)
+     • Dented car body panel (junkyard replacement: $40–150)
+     • Cracked headlight or fender from a car (junkyard: $30–100)
+     • Cracked glass on furniture, picture frames, cabinet doors
+     • Replacing a worn cord on a lamp or appliance
+     • Replacing a fuse, switch, or outlet
+     • Re-attaching trim, hinges, or cosmetic pieces
+     • Light cleaning of upholstery, sanding/refinishing wood furniture
+
+   What counts as hard_expensive_fix (specialist required, or proprietary
+   parts that can't be sourced cheaply):
+     • Missing PROPRIETARY battery for a specific brand of e-bike, drone,
+       or modern power tool, where even a used aftermarket replacement
+       costs more than 30% of the item's resale value
+     • Cracked LCD/OLED screens on phones, tablets, laptops (requires
+       specialty tools and risk of further damage during the swap)
+     • Internal electronics failure on a sealed unit (motherboard, logic
+       board) where diagnosis is uncertain
+     • Engine, transmission, or drivetrain failure on a vehicle
+     • Refrigerant or sealed-system work on appliances (requires EPA cert)
+     • Soldering or board-level repair
+     • Anything where replacement parts cost > 30% of resale value AND
+       can't be sourced from a junkyard / aftermarket / used market
+     • Missing keys for proprietary locks, safes, or vehicles where a
+       locksmith / dealer is required
+     • Custom-fit or VIN-specific parts not available used
+     • Items whose only fix is "send it in to manufacturer for $X service"
+
+   What is "not_applicable":
+     • Item has no condition issue worth fixing (pristine or good)
 
    IMPORTANT: items with condition_severity="broken_or_unsellable" AND
    repairability="hard_expensive_fix" will have their estimated value
@@ -163,7 +196,30 @@ For each item, fill in ALL fields:
    "missing the manual" or "no original box," that is NOT broken_or_unsellable.
    Cosmetic-only issues are "flawed" + "easy_cheap_fix" or "not_applicable".
 
-7. NOTES — 1–2 short sentences: identify what you think the item is, mention
+7. REPAIR_COST_USD — concrete dollar estimate for PARTS ONLY (assume free
+   handyman labor from the buyer's network), using AFTERMARKET / used /
+   generic / junkyard sources where applicable. This number is folded into
+   the total acquisition cost when computing the deal score, so accuracy
+   matters more than tier labels. Calibration:
+     • Missing standard cable (USB-C, HDMI, AC):     8–12
+     • Missing generic remote:                       12–15
+     • Missing screws/hardware:                      5
+     • Missing universal wall adapter:               10–15
+     • Missing manual:                               0 (PDF online)
+     • Junkyard car bumper / fender / quarter panel: 40–100
+     • Junkyard headlight assembly:                  30–80
+     • Replacement glass for cabinet/picture frame:  10–40
+     • Used proprietary tool battery (DeWalt 20V):   60–120
+     • Used phone screen (mid-tier, DIY kit):        50–90
+     • Drone proprietary battery:                    80–200
+     • Generator carb rebuild kit:                   25–60
+     • Replacement lamp/appliance cord:              5–10
+   Use 0 if condition is pristine/good (no repair needed). Use 0 if you've
+   set condition_severity=broken_or_unsellable AND repairability=
+   hard_expensive_fix (the item gets zeroed out anyway, so the repair
+   cost is moot).
+
+8. NOTES — 1–2 short sentences: identify what you think the item is, mention
    any specific fix needed and rough cost, or why you're uncertain.
 
 CONSISTENCY CHECK: The notes must agree with the structured fields. Do not
