@@ -58,8 +58,10 @@ CSV_FIELDS = [
     "ai_sales_velocity",     # hot / normal / slow / very_slow / unknown
     "ai_condition_severity", # pristine / good / flawed / broken_or_unsellable
     "ai_repairability",      # easy_cheap_fix / hard_expensive_fix / not_applicable
+    "ai_repair_cost_usd",    # estimated $ to fix (aftermarket parts OK), 0 if no repair needed
     "value_overridden",      # "yes" if we forced resale to $0
     "title",
+    "location",              # "City, ST" of the auction house
     "ai_notes",
     "category",
     "next_required_bid",
@@ -235,6 +237,11 @@ def do_scrape(existing: dict[str, Item], limit: int | None = None) -> dict[str, 
             old.time_remaining = fresh.time_remaining
             old.closing_time_raw = fresh.closing_time_raw
             old.scraped_at = fresh.scraped_at
+            # Backfill location for items cached before we started scraping it.
+            # Don't overwrite if we already have one — keeps things stable
+            # if a single re-scrape misses the auction-house header for any reason.
+            if fresh.location and not old.location:
+                old.location = fresh.location
             refresh_count += 1
         else:
             existing[key] = fresh
@@ -257,8 +264,27 @@ def do_scrape(existing: dict[str, Item], limit: int | None = None) -> dict[str, 
     return existing
 
 
+def _is_closed(it: Item) -> bool:
+    """True if this item's auction has already ended.
+
+    Uses closing_time_iso (parsed UTC) when present. If the timestamp can't
+    be parsed, we play it safe and return False — better to spend a Gemini
+    call on a possibly-still-open item than skip a real one.
+    """
+    if not it.closing_time_iso:
+        return False
+    try:
+        close = datetime.fromisoformat(it.closing_time_iso.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return False
+    return close <= datetime.now(timezone.utc)
+
+
 def do_enrich(items: dict[str, Item], limit: int | None = None) -> dict[str, Item]:
     """Call Gemini in batches for items that don't yet have an AI estimate.
+
+    Skips items whose auction has already closed — there's no point spending
+    quota on lots we can't bid on anymore.
 
     If `limit` is not None, only enrich up to that many of the pending items
     (used by --test mode to cap quota burn). The cap applies to the pending
@@ -269,8 +295,15 @@ def do_enrich(items: dict[str, Item], limit: int | None = None) -> dict[str, Ite
     pending: list[Item] = [
         it for it in items.values()
         if not it.ai_confidence  # never enriched before
+        and not _is_closed(it)   # auction still open
     ]
+    skipped_closed = sum(
+        1 for it in items.values()
+        if not it.ai_confidence and _is_closed(it)
+    )
     print(f"\n=== ENRICH ===")
+    if skipped_closed:
+        print(f"  skipping {skipped_closed} unenriched items whose auctions have already closed")
     if limit is not None and len(pending) > limit:
         print(f"  (test mode: capping enrichment at {limit} of {len(pending)} pending)")
         pending = pending[:limit]
@@ -325,18 +358,24 @@ def do_enrich(items: dict[str, Item], limit: int | None = None) -> dict[str, Ite
             it.ai_confidence = v.confidence
             it.ai_condition_severity = v.condition_severity
             it.ai_repairability = v.repairability
+            it.ai_repair_cost_usd = f"{v.repair_cost_usd:.2f}"
             it.ai_sales_velocity = v.sales_velocity
 
             # ── Deterministic override for unsellable items ──
-            # The model commits to structured fields (condition_severity +
-            # repairability), so we don't have to parse its prose. If the
-            # model itself says "broken_or_unsellable" AND the fix is
-            # expensive, we force resale = $0. This is the smart-nuance fix
-            # the user requested: missing battery → $0; missing power cord →
-            # keep value (model would mark that as easy_cheap_fix).
+            # Only force resale to $0 when the model says BOTH "broken_or_
+            # unsellable" AND "hard_expensive_fix". The smarter penalty for
+            # mid-range cases (broken + cheap fix, or flawed + expensive fix)
+            # comes from folding repair_cost_usd into the cost denominator.
+            # That preserves the missing-power-cable projector case the user
+            # called out: easy_cheap_fix items keep most of their value;
+            # only the truly-worthless category zeroes out.
             if (v.condition_severity == "broken_or_unsellable"
                     and v.repairability == "hard_expensive_fix"):
                 estimated_resale = 0.0
+                # Also zero the repair cost — no point "spending" on parts
+                # for an item we've decided is worthless. Otherwise gross
+                # profit would show as -repair_cost, which is misleading.
+                it.ai_repair_cost_usd = "0.00"
                 it.value_overridden = "yes"
             else:
                 it.value_overridden = ""
@@ -380,12 +419,42 @@ def _purchase_price(it: Item) -> float | None:
     return bid * config.PURCHASE_PRICE_MULTIPLIER
 
 
+def _repair_cost(it: Item) -> float:
+    """Estimated $ to make this item sellable.
+
+    Only returns a number when the model gave us one (ai_repair_cost_usd is
+    populated). For legacy items enriched before we asked the model for a
+    dollar amount, we return 0 — those items already got their flip_score
+    written at enrichment time and we don't re-enrich. Going forward, every
+    NEW item gets a real repair-cost estimate from Gemini.
+
+    Aftermarket / used / junkyard sources are assumed in the model's
+    estimate (see the prompt). A handyman with normal tools — basic
+    mechanical, cosmetic, light electrical — is the assumed labor.
+    """
+    if not it.ai_repair_cost_usd:
+        return 0.0
+    try:
+        cost = float(it.ai_repair_cost_usd)
+        return cost if cost >= 0 else 0.0
+    except (ValueError, TypeError):
+        return 0.0
+
+
 def compute_flip_score(it: Item) -> str:
-    """flip_score (ROI) = (estimated_resale - purchase_price - hassle) / purchase_price
+    """flip_score (ROI) =
+        (estimated_resale - total_cost - hassle) / total_cost
+    where total_cost = purchase_price + repair_cost.
 
     purchase_price = next_required_bid * PURCHASE_PRICE_MULTIPLIER, which models
     buyer's premium + tax + fees. The bid alone underestimates real cost by
     roughly 30%.
+
+    repair_cost is the model's estimate of what it takes to make the item
+    sellable — aftermarket parts, junkyard pulls, generic replacements.
+    Folding it into total cost (instead of subtracting it from resale) means
+    a $10 bid + $50 repair correctly ranks below a $10 bid + $0 repair when
+    measured as "ROI per dollar I actually put in."
 
     Returns a string. Empty if unknown / can't compute.
     """
@@ -398,17 +467,22 @@ def compute_flip_score(it: Item) -> str:
         purchase_price = _purchase_price(it)
         if purchase_price is None:
             return ""
-        bid_floor = max(purchase_price, 1.0)
-        score = (estimated_resale - purchase_price - config.PICKUP_HASSLE_DOLLARS) / bid_floor
+        repair_cost = _repair_cost(it)
+        total_cost = purchase_price + repair_cost
+        cost_floor = max(total_cost, 1.0)
+        score = (estimated_resale - total_cost - config.PICKUP_HASSLE_DOLLARS) / cost_floor
         return f"{score:.2f}"
     except (ValueError, TypeError):
         return ""
 
 
 def compute_gross_profit(it: Item) -> str:
-    """Absolute dollar profit: estimated_resale - purchase_price - hassle.
+    """Absolute dollar profit:
+        estimated_resale - purchase_price - repair_cost - hassle.
 
-    Same purchase-price model as flip_score (next_bid * 1.3).
+    Same as flip_score's numerator. The denominator is what differs (gross
+    profit is in dollars, not a ratio).
+
     Returns a string. Empty if unknown / can't compute.
     """
     try:
@@ -420,7 +494,11 @@ def compute_gross_profit(it: Item) -> str:
         purchase_price = _purchase_price(it)
         if purchase_price is None:
             return ""
-        profit = estimated_resale - purchase_price - config.PICKUP_HASSLE_DOLLARS
+        repair_cost = _repair_cost(it)
+        profit = (estimated_resale
+                  - purchase_price
+                  - repair_cost
+                  - config.PICKUP_HASSLE_DOLLARS)
         return f"{profit:.2f}"
     except (ValueError, TypeError):
         return ""
