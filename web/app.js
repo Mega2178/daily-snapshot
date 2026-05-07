@@ -5,9 +5,8 @@
 //                the browser.
 // State persist: filter/sort/search/scroll/renderedCount survive a page reload
 //                via sessionStorage, so "Load more" + scroll position aren't lost.
-// Auto-refresh:  polls items.json every 5 minutes; when generated_at changes,
-//                shows a banner the user can click to reload (we don't yank
-//                them out of mid-scroll automatically).
+// Refresh:       there is intentionally no auto-refresh banner. To get a fresh
+//                snapshot, hard-reload the page (Ctrl+Shift+R).
 // Service Worker (sw.js) caches the static files + items.json so repeat
 // visits are instant; a fresh copy is fetched in the background.
 
@@ -15,9 +14,8 @@
   "use strict";
 
   const PAGE_SIZE = 60;                  // cards rendered per "page"
-  const POLL_INTERVAL_MS = 5 * 60_000;   // check for new data every 5 min
   const STATE_KEY = "daily-snapshot:ui-state";
-  const STATE_VERSION = 2;               // bump if state schema changes
+  const STATE_VERSION = 3;               // bump if state schema changes
 
   // ─── Smart-score weights (request #5) ───────────────────────────
   // Smart score = w_roi*ROI_norm + w_profit*profit_norm + w_velocity*velocity_norm
@@ -66,7 +64,6 @@
   const velocitySel    = document.getElementById("velocity");
   const minFlipInput   = document.getElementById("min-flip");
   const minFlipValue   = document.getElementById("min-flip-value");
-  const showClosedCb   = document.getElementById("show-closed");
   const searchInput    = document.getElementById("search");
   const searchClear    = document.getElementById("search-clear");
   const freshnessEl    = document.getElementById("freshness");
@@ -76,12 +73,6 @@
   const loadMoreWrap   = document.getElementById("load-more-wrap");
   const loadMoreBtn    = document.getElementById("load-more");
   const loadMoreInfo   = document.getElementById("load-more-info");
-  const refreshBanner  = document.getElementById("refresh-banner");
-  const refreshAction  = document.getElementById("refresh-banner-action");
-  const refreshDismiss = document.getElementById("refresh-banner-dismiss");
-
-  // sessionStorage key for the "ack'd" generated_at — see showRefreshBanner / dismiss handlers.
-  const REFRESH_ACK_KEY = "daily-snapshot:refresh-ack-iso";
 
   // ---- State ------------------------------------------------------
   let allItems        = [];
@@ -91,7 +82,6 @@
   let nowMs           = Date.now();
   let pendingRestore  = null; // { renderedCount, scrollY } from sessionStorage
   let saveStateTimer  = null;
-  let pollTimer       = null;
   let searchDebounce  = null;
   let searchQueryNorm = "";   // lowercased + trimmed; used by filter
 
@@ -100,7 +90,6 @@
   registerServiceWorker();
   loadData();
   bindControls();
-  startPolling();
   bindUnloadSave();
 
   // Re-tick "now" each minute — only relabels closing times in already-
@@ -153,76 +142,6 @@
     }
   }
 
-  // ---- Background polling for new snapshots ----------------------
-  function startPolling() {
-    pollTimer = setInterval(checkForNewSnapshot, POLL_INTERVAL_MS);
-    // Also check when the tab becomes visible — common case is "leave laptop
-    // open overnight, come back in the morning". A 5-min poll has probably
-    // already fired but this catches the case where it hasn't.
-    document.addEventListener("visibilitychange", () => {
-      if (!document.hidden) checkForNewSnapshot();
-    });
-  }
-
-  async function checkForNewSnapshot() {
-    if (refreshBanner && !refreshBanner.hidden) return; // banner already up
-    // If the initial loadData() hasn't finished yet, generatedAt is null and
-    // we have nothing to compare against. Bail — we'll re-check on the next
-    // interval / visibilitychange after data is loaded.
-    if (!generatedAt) return;
-    try {
-      // Use {cache:"no-store"} here so we explicitly bypass HTTP caches —
-      // we want to know if the server has a NEWER copy than what we loaded.
-      // The SW also forwards this to the network in network-first mode.
-      const res = await fetch("data/items.json", { cache: "no-store" });
-      if (!res.ok) return;
-      const data = await res.json();
-      const fresh = data.generated_at ? new Date(data.generated_at) : null;
-      if (!fresh || isNaN(fresh.getTime())) return;
-      // Strictly newer than what's currently displayed — equal timestamps
-      // mean same snapshot, no banner.
-      if (fresh.getTime() <= generatedAt.getTime()) return;
-      // ALSO: don't re-prompt for a snapshot the user already acknowledged.
-      // This guards against two real-world flap cases:
-      //   1. GitHub Pages CDN propagation lag — different edges briefly serve
-      //      different versions, so the user can see a banner, click refresh,
-      //      reload, hit a stale edge, and immediately see the banner again.
-      //   2. Reload races — visibilitychange firing before loadData()
-      //      completes, then the polling getting a slightly newer file.
-      // We remember the latest generated_at the user has seen/dismissed in
-      // sessionStorage. The banner only shows if `fresh` exceeds BOTH the
-      // currently-loaded data AND the ack'd value.
-      const ack = getRefreshAck();
-      if (ack && fresh.getTime() <= ack) return;
-      showRefreshBanner(fresh);
-    } catch (err) {
-      // Network blip — quietly retry on next interval.
-    }
-  }
-
-  function showRefreshBanner(freshDate) {
-    if (!refreshBanner) return;
-    refreshBanner.hidden = false;
-    if (freshDate instanceof Date && !isNaN(freshDate.getTime())) {
-      refreshBanner.dataset.freshIso = freshDate.toISOString();
-    }
-  }
-
-  function getRefreshAck() {
-    try {
-      const v = sessionStorage.getItem(REFRESH_ACK_KEY);
-      if (!v) return null;
-      const t = Date.parse(v);
-      return isNaN(t) ? null : t;
-    } catch { return null; }
-  }
-
-  function setRefreshAck(iso) {
-    try {
-      if (iso) sessionStorage.setItem(REFRESH_ACK_KEY, iso);
-    } catch { /* private mode / quota */ }
-  }
-
   // ---- Controls ---------------------------------------------------
   function bindControls() {
     // Restore values from saved state before we wire change handlers (so we
@@ -239,9 +158,6 @@
       if (typeof pendingRestore.minFlip === "number") {
         minFlipInput.value = String(pendingRestore.minFlip);
       }
-      if (typeof pendingRestore.showClosed === "boolean") {
-        showClosedCb.checked = pendingRestore.showClosed;
-      }
       if (typeof pendingRestore.search === "string") {
         searchInput.value = pendingRestore.search;
         searchQueryNorm = pendingRestore.search.trim().toLowerCase();
@@ -251,7 +167,6 @@
 
     sortSel.addEventListener("change", () => { render(); saveStateSoon(); });
     velocitySel.addEventListener("change", () => { render(); saveStateSoon(); });
-    showClosedCb.addEventListener("change", () => { render(); saveStateSoon(); });
     minFlipInput.addEventListener("input", () => {
       minFlipValue.textContent = parseFloat(minFlipInput.value).toFixed(1);
       render();
@@ -281,71 +196,6 @@
 
     loadMoreBtn.addEventListener("click", () => { renderMore(); saveStateSoon(); });
 
-    if (refreshAction) {
-      refreshAction.addEventListener("click", async () => {
-        // Save state synchronously before reload so the user lands back where
-        // they were (with the new data layered in).
-        saveUiStateNow();
-        // Record that we're refreshing FOR this specific snapshot timestamp,
-        // so that a CDN propagation flap right after reload doesn't pop the
-        // banner up again immediately. After reload, loadData() will pick up
-        // either this snapshot (great, ack matches generatedAt) or a still-
-        // newer one (then ack is older than generatedAt, no banner — also fine).
-        const freshIso = refreshBanner && refreshBanner.dataset.freshIso;
-        if (freshIso) setRefreshAck(freshIso);
-        // Reload safely w.r.t. the service worker.
-        // The fetch we just did to detect the new snapshot also triggered the
-        // SW to update its data cache. But there's a related risk: if a new
-        // VERSION of the SW itself is waiting to activate (because we shipped
-        // new app.js / index.html / style.css), a plain location.reload()
-        // might still hit the OLD SW and get OLD cached assets. To avoid this:
-        //   1. Ask the SW registration to update.
-        //   2. If a new worker is found, send it skipWaiting and wait for it
-        //      to take control, then reload.
-        //   3. Otherwise, just reload.
-        // Worst case we fall through to the simple reload, which is still
-        // correct — just might serve cached items.json on a brief network hiccup.
-        try {
-          if ("serviceWorker" in navigator && navigator.serviceWorker.controller) {
-            const reg = await navigator.serviceWorker.getRegistration();
-            if (reg) {
-              await reg.update();   // pull latest sw.js from network
-              const waiting = reg.waiting;
-              if (waiting) {
-                // A new SW is waiting — promote it and reload AFTER it takes over.
-                let reloaded = false;
-                navigator.serviceWorker.addEventListener("controllerchange", () => {
-                  if (reloaded) return;
-                  reloaded = true;
-                  location.reload();
-                });
-                waiting.postMessage({ type: "SKIP_WAITING" });
-                // Safety net: if controllerchange doesn't fire within 2s
-                // (some browsers / edge cases), just reload anyway.
-                setTimeout(() => { if (!reloaded) location.reload(); }, 2000);
-                return;
-              }
-            }
-          }
-        } catch (err) {
-          // Fall through to simple reload.
-        }
-        location.reload();
-      });
-    }
-
-    if (refreshDismiss) {
-      refreshDismiss.addEventListener("click", () => {
-        // User explicitly dismissed the banner. Record the timestamp they
-        // just saw as ack'd so we don't re-prompt for the same snapshot,
-        // and hide the banner. Future scrapes (with newer generated_at)
-        // will still trigger it.
-        const freshIso = refreshBanner && refreshBanner.dataset.freshIso;
-        if (freshIso) setRefreshAck(freshIso);
-        if (refreshBanner) refreshBanner.hidden = true;
-      });
-    }
-
     // Save scroll position as the user scrolls, debounced.
     window.addEventListener("scroll", () => { saveStateSoon(); }, { passive: true });
   }
@@ -363,7 +213,6 @@
         sort: sortSel.value,
         velocity: velocitySel.value,
         minFlip: parseFloat(minFlipInput.value),
-        showClosed: showClosedCb.checked,
         search: searchInput.value,
         renderedCount: renderedCount,
         scrollY: window.scrollY || window.pageYOffset || 0,
@@ -469,26 +318,52 @@
     return isNaN(n) ? NaN : n * PURCHASE_PRICE_MULT;
   }
 
-  // Recompute flip score (ROI) from raw fields. This stays in sync with
-  // compute_flip_score() in scrape.py — uses the SAME purchase-price model.
+  // Estimated $ to make this item sellable. Mirrors _repair_cost() in scrape.py.
+  // Returns the model's number when present, 0 otherwise. Items enriched
+  // before we asked the model for a $ figure show repair=$0 — their flip
+  // scores remain unchanged from the day they were enriched, which is fine
+  // because we don't re-enrich.
+  function repairCostOf(item) {
+    if (item._rc !== undefined) return item._rc;
+    const direct = num(item.ai_repair_cost_usd);
+    item._rc = (!isNaN(direct) && direct >= 0) ? direct : 0;
+    return item._rc;
+  }
+
+  // Total acquisition cost: what you actually put in to flip the item.
+  // Folding repair into cost (instead of subtracting from resale) makes
+  // ROI a true "return per dollar invested" — a $10 bid + $50 repair
+  // correctly looks tighter than a $10 bid + $0 repair for the same resale.
+  function totalCostOf(item) {
+    if (item._tc !== undefined) return item._tc;
+    const purchase = purchasePriceNum(item);
+    if (isNaN(purchase)) { item._tc = NaN; return NaN; }
+    item._tc = purchase + repairCostOf(item);
+    return item._tc;
+  }
+
+  // Recompute flip score (ROI) from raw fields. Stays in sync with
+  // compute_flip_score() in scrape.py — same purchase-price model and
+  // same repair-as-cost treatment.
   function computeFlipScore(item) {
     const resale = num(item.ai_estimated_resale);
-    const cost   = purchasePriceNum(item);
-    if (isNaN(resale) || isNaN(cost) || resale <= 0) return NaN;
-    const denom = Math.max(cost, 1.0);
-    return (resale - cost - HASSLE) / denom;
+    const total  = totalCostOf(item);
+    if (isNaN(resale) || isNaN(total) || resale <= 0) return NaN;
+    const denom = Math.max(total, 1.0);
+    return (resale - total - HASSLE) / denom;
   }
   function flipScoreOf(item) {
     if (item._fs === undefined) item._fs = computeFlipScore(item);
     return item._fs;
   }
 
-  // Gross profit in dollars: resale - cost - hassle.
+  // Gross profit in dollars: resale - total_cost - hassle.
+  // Same numerator as flip_score; differs only in normalization.
   function computeGrossProfit(item) {
     const resale = num(item.ai_estimated_resale);
-    const cost   = purchasePriceNum(item);
-    if (isNaN(resale) || isNaN(cost) || resale <= 0) return NaN;
-    return resale - cost - HASSLE;
+    const total  = totalCostOf(item);
+    if (isNaN(resale) || isNaN(total) || resale <= 0) return NaN;
+    return resale - total - HASSLE;
   }
   function grossProfitOf(item) {
     if (item._gp === undefined) item._gp = computeGrossProfit(item);
@@ -540,20 +415,44 @@
     return t < nowMs;
   }
 
-  // Search haystack: title + AI notes + category + description.
-  // Built lazily and cached on the item. Lowercased so we can do
-  // case-insensitive matching cheaply against the query regexes.
-  function haystackOf(item) {
-    if (item._hay === undefined) {
+  // Count how many items in allItems aren't closed yet. Cached per-minute
+  // so we don't walk the whole array on every render. The cache is keyed
+  // by (allItems length, current minute) — both have to match for a hit,
+  // which means the count refreshes when new data loads OR a minute ticks.
+  let _openCountCache = { len: -1, minute: -1, value: 0 };
+  function countOpenItems() {
+    const minute = Math.floor(nowMs / 60_000);
+    if (_openCountCache.len === allItems.length && _openCountCache.minute === minute) {
+      return _openCountCache.value;
+    }
+    let n = 0;
+    for (let i = 0; i < allItems.length; i++) {
+      if (!isClosed(allItems[i])) n++;
+    }
+    _openCountCache = { len: allItems.length, minute: minute, value: n };
+    return n;
+  }
+
+  // Split haystacks: we score title hits higher than body hits so a search
+  // for "car" surfaces "Car Stereo" before a dog ramp whose AI notes happen
+  // to contain "carpet". Built lazily and cached on the item.
+  function titleHayOf(item) {
+    if (item._titleHay === undefined) {
+      item._titleHay = (item.title || "").toLowerCase();
+    }
+    return item._titleHay;
+  }
+  function bodyHayOf(item) {
+    if (item._bodyHay === undefined) {
       const parts = [
-        item.title,
         item.ai_notes,
         item.category,
         item.description,
+        item.location,
       ].filter(Boolean);
-      item._hay = parts.join(" \n ").toLowerCase();
+      item._bodyHay = parts.join(" \n ").toLowerCase();
     }
-    return item._hay;
+    return item._bodyHay;
   }
 
   // Build search-term regexes from the user's query.
@@ -574,18 +473,75 @@
     if (!query) return null;
     const terms = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
     if (terms.length === 0) return null;
-    return terms.map((t) => new RegExp("\\b" + escapeRegex(t)));
+    return terms.map((t) => ({
+      raw: t,
+      // Word-start regex: matches "hammer" inside "hammers" but not inside
+      // "sledgehammer". This is the same pattern that was here before.
+      re: new RegExp("\\b" + escapeRegex(t)),
+    }));
   }
   function escapeRegex(s) {
     return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   }
-  function matchesSearch(item, termRegexes) {
-    if (!termRegexes) return true;
-    const hay = haystackOf(item);
-    for (let i = 0; i < termRegexes.length; i++) {
-      if (!termRegexes[i].test(hay)) return false;
+
+  // Filter test: does this item pass the search? We require EVERY term to
+  // appear SOMEWHERE — title or body — at a word boundary. The relevance
+  // score (below) decides where it ranks among the survivors.
+  function matchesSearch(item, terms) {
+    if (!terms) return true;
+    const titleHay = titleHayOf(item);
+    const bodyHay = bodyHayOf(item);
+    for (let i = 0; i < terms.length; i++) {
+      if (!terms[i].re.test(titleHay) && !terms[i].re.test(bodyHay)) return false;
     }
     return true;
+  }
+
+  // Relevance score for ranking search hits. Higher = better.
+  // The score is constructed so that ALL items matching in title rank above
+  // ANY item matching only in body, regardless of how many body hits the
+  // body-only item has. That's the user's #3: "if the title has the searched
+  // word, it goes up; the random bs goes near the bottom."
+  //
+  // Per-term contribution:
+  //   • title startsWith term:    1000 (exact prefix — "car" matches "Car Stereo...")
+  //   • title contains term word: 500  ("car" in "...New Car Battery...")
+  //   • title contains term substr: 200 ("car" in "Carpet Cleaner")
+  //   • body word match:          10
+  //   • body substring match:     1
+  //   • no match for this term:   we'd already be filtered out
+  //
+  // Multi-term queries sum each term's score. So "car battery" giving 1000+500
+  // (title prefix on "car", title word on "battery") beats 200+10 from a body match.
+  function searchRelevance(item, terms) {
+    if (!terms) return 0;
+    let score = 0;
+    const titleHay = titleHayOf(item);
+    const bodyHay = bodyHayOf(item);
+    for (let i = 0; i < terms.length; i++) {
+      const t = terms[i];
+      if (titleHay.startsWith(t.raw)) {
+        score += 1000;
+      } else if (t.re.test(titleHay)) {
+        score += 500;
+      } else if (titleHay.indexOf(t.raw) !== -1) {
+        score += 200;
+      } else if (t.re.test(bodyHay)) {
+        score += 10;
+      } else if (bodyHay.indexOf(t.raw) !== -1) {
+        score += 1;
+      }
+    }
+    return score;
+  }
+  function relevanceOf(item, terms) {
+    // Cache only when terms object hasn't changed — terms is rebuilt on every
+    // render() call so we tag it with a render-scoped marker.
+    if (item._relTerms !== terms) {
+      item._rel = searchRelevance(item, terms);
+      item._relTerms = terms;
+    }
+    return item._rel;
   }
 
   // ---- Sort comparators ------------------------------------------
@@ -632,24 +588,45 @@
   // ---- Render -----------------------------------------------------
   function render() {
     const minFlip      = parseFloat(minFlipInput.value);
-    const showClosed   = showClosedCb.checked;
     const sortBy       = sortSel.value;
     const velocityMode = velocitySel.value;
-    const termRegexes  = buildSearchTerms(searchQueryNorm);
+    const terms        = buildSearchTerms(searchQueryNorm);
 
     filteredItems = allItems.filter((it) => {
-      if (!showClosed && isClosed(it)) return false;
+      // Closed items are NEVER shown — they're not actionable. The "Show
+      // closed" toggle was removed; if a user really wants to see closed
+      // lots they can browse the source site directly.
+      if (isClosed(it)) return false;
       if (!passesVelocityFilter(it, velocityMode)) return false;
-      if (!matchesSearch(it, termRegexes)) return false;
+      if (!matchesSearch(it, terms)) return false;
       const f = flipScoreOf(it);
       if (isNaN(f)) return minFlip === 0;
       return f >= minFlip;
     });
 
-    filteredItems.sort(COMPARATORS[sortBy] || COMPARATORS.smart);
+    // When a search is active, rank by relevance FIRST, then by the user's
+    // chosen sort as a tiebreaker. This way "car" surfaces title-matching
+    // items before body-matching ones, but within each relevance tier we
+    // still order by smart score / ROI / closing time / etc.
+    const baseCmp = COMPARATORS[sortBy] || COMPARATORS.smart;
+    if (terms) {
+      filteredItems.sort((a, b) => {
+        const ra = relevanceOf(a, terms);
+        const rb = relevanceOf(b, terms);
+        if (rb !== ra) return rb - ra;   // higher relevance first
+        return baseCmp(a, b);
+      });
+    } else {
+      filteredItems.sort(baseCmp);
+    }
 
+    // The total used in the "X of Y items" display is the count of OPEN
+    // items, not the raw allItems length. Closed lots aren't actionable —
+    // showing them in the denominator just inflates the number visually
+    // ("155 of 10,383" → most of those 10,383 are already over).
+    const openTotal = countOpenItems();
     resultCount.textContent =
-      `${filteredItems.length} of ${allItems.length} item${allItems.length === 1 ? "" : "s"}`;
+      `${filteredItems.length} of ${openTotal} item${openTotal === 1 ? "" : "s"}`;
 
     // Reset paging and clear the grid
     renderedCount = 0;
@@ -658,13 +635,12 @@
     if (filteredItems.length === 0) {
       grid.classList.add("grid--empty");
       const reasons = [];
-      if (query) reasons.push("clear the search");
-      if (!showClosed) reasons.push('toggle "Show closed"');
+      if (searchQueryNorm) reasons.push("clear the search");
       if (minFlip > 0) reasons.push("lower the min flip score");
       if (velocityMode !== "any") reasons.push("change Velocity to Any");
       const hint = reasons.length
         ? `Try ${reasons.join(" or ")} to see more.`
-        : "There are no items in the data file.";
+        : "There are no open items in the data file.";
       grid.innerHTML = `<p>No items match the current filters.<br><small>${hint}</small></p>`;
       loadMoreWrap.hidden = true;
       return;
@@ -742,8 +718,8 @@
       scoreEl.textContent = f.toFixed(2) + "×";
       scoreEl.title =
         `ROI: ${f.toFixed(2)}× — ` +
-        `(resale est. − purchase cost − $${HASSLE.toFixed(0)} hassle) ÷ purchase cost. ` +
-        `Purchase cost = next bid × ${PURCHASE_PRICE_MULT.toFixed(1)} (fees + tax).`;
+        `(resale − total cost − $${HASSLE.toFixed(0)} hassle) ÷ total cost. ` +
+        `Total cost = (next bid × ${PURCHASE_PRICE_MULT.toFixed(1)}) + repair cost.`;
     }
 
     // Gross profit badge ($)
@@ -780,13 +756,29 @@
     // Title
     node.querySelector('[data-role="title"]').textContent = item.title || "(untitled)";
 
-    // Stats: bid, purchase cost (×1.3), resale, retail
+    // Stats: bid, purchase cost (×1.3), repair, resale, retail
     node.querySelector('[data-role="bid"]').textContent = item.current_bid || "—";
     const costEl = node.querySelector('[data-role="purchase-price"]');
     if (costEl) {
       const cost = purchasePriceNum(item);
       costEl.textContent = isNaN(cost) ? "—" : "$" + cost.toFixed(2);
       costEl.title = "Realistic out-of-pocket: next required bid × 1.3 (fees + tax)";
+    }
+    const repairEl = node.querySelector('[data-role="repair"]');
+    if (repairEl) {
+      const r = repairCostOf(item);
+      // Show "—" for zero so the stat visually fades out for items with no
+      // condition issue. Anything > 0 shows the dollar amount the model
+      // estimated for parts (handyman labor assumed free).
+      if (r > 0) {
+        repairEl.textContent = "$" + r.toFixed(2);
+        repairEl.title =
+          "Estimated parts cost to make this sellable. Aftermarket / used / " +
+          "junkyard sources assumed; handyman labor assumed free.";
+      } else {
+        repairEl.textContent = "—";
+        repairEl.title = "No repair needed";
+      }
     }
     const resale = num(item.ai_estimated_resale);
     node.querySelector('[data-role="resale"]').textContent =
@@ -801,6 +793,13 @@
     closingEl.textContent = formatClosing(item);
     if (isClosed(item)) closingEl.classList.add("closed");
     categoryEl.textContent = shortCategory(item.category);
+
+    // Location ("City, ST"). Empty-string content keeps the :empty CSS rule
+    // hiding the row when we don't have a location for this item.
+    const locationEl = node.querySelector('[data-role="location"]');
+    if (locationEl) {
+      locationEl.textContent = item.location || "";
+    }
 
     // Click anywhere → open in new tab
     if (item.item_url) {
