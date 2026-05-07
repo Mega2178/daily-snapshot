@@ -16,16 +16,6 @@
       </div>
     </div>
 
-    <!-- Refresh banner — appears when a newer items.json is detected -->
-    <div id="refresh-banner" class="refresh-banner" hidden>
-      <button id="refresh-banner-action" class="refresh-banner__main" type="button">
-        <span class="refresh-banner__pulse" aria-hidden="true"></span>
-        <span class="refresh-banner__text">New snapshot available</span>
-        <span class="refresh-banner__cta">Refresh →</span>
-      </button>
-      <button id="refresh-banner-dismiss" class="refresh-banner__dismiss" type="button" aria-label="Dismiss">×</button>
-    </div>
-
     <!-- Search bar -->
     <div class="search-row">
       <label class="search">
@@ -72,11 +62,6 @@
         <input id="min-flip" type="range" min="0" max="3" step="0.1" value="0.5">
       </label>
 
-      <label class="control control--inline">
-        <input id="show-closed" type="checkbox">
-        <span>Show closed</span>
-      </label>
-
       <div class="control-meta" id="result-count" aria-live="polite"></div>
     </div>
   </header>
@@ -105,6 +90,7 @@
         <dl class="card-stats">
           <div><dt>Bid</dt><dd data-role="bid"></dd></div>
           <div><dt>Cost (×1.3)</dt><dd data-role="purchase-price"></dd></div>
+          <div><dt>Repair</dt><dd data-role="repair"></dd></div>
           <div><dt>Resale est.</dt><dd data-role="resale"></dd></div>
           <div><dt>Retail est.</dt><dd data-role="retail"></dd></div>
         </dl>
@@ -112,6 +98,7 @@
           <span data-role="closing"></span>
           <span class="card-category" data-role="category"></span>
         </div>
+        <div class="card-location" data-role="location"></div>
       </div>
     </article>
   </template>
