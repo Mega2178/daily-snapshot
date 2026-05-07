@@ -62,9 +62,7 @@ class Item:
     ai_resale_pct: str = ""
     ai_estimated_resale: str = ""
     ai_confidence: str = ""
-    ai_condition_severity: str = ""  # pristine/good/flawed/broken_or_unsellable
-    ai_repairability: str = ""        # easy_cheap_fix/hard_expensive_fix/not_applicable
-    ai_repair_cost_usd: str = ""      # model's $ estimate to make item sellable (aftermarket/used parts OK)
+    ai_condition: str = ""           # new/open_box/damaged_easy_fix/damaged_hard_fix
     ai_sales_velocity: str = ""       # hot/normal/slow/very_slow/unknown
     value_overridden: str = ""        # "yes" if we forced resale to $0
     ai_notes: str = ""
