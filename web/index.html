@@ -39,7 +39,6 @@
           <option value="smart">Smart score (ROI × profit × velocity)</option>
           <option value="flip_score">ROI / flip score (high → low)</option>
           <option value="gross_profit">Gross profit (high → low)</option>
-          <option value="condition">Condition (best → worst)</option>
           <option value="current_bid">Next required bid (low → high)</option>
           <option value="closing_time">Closing time (soonest)</option>
           <option value="title">Title (A → Z)</option>
@@ -53,6 +52,16 @@
           <option value="hot">Hot only</option>
           <option value="hot_or_normal">Hot or normal</option>
           <option value="exclude_very_slow">Exclude very slow</option>
+        </select>
+      </label>
+
+      <label class="control">
+        <span class="control-label">Condition</span>
+        <select id="condition">
+          <option value="any">Any</option>
+          <option value="new">New only</option>
+          <option value="new_or_open_box">New or open box</option>
+          <option value="exclude_hard_fix">Exclude hard fix</option>
         </select>
       </label>
 
