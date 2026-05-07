@@ -53,10 +53,8 @@ class ItemValuation(BaseModel):
     resale_pct: float = Field(description="Estimated resale value as % of retail in the Kansas City secondhand market (Facebook Marketplace / OfferUp). E.g. 0.55 means used items typically sell for 55% of retail. Use 0 if unknown.")
     sales_velocity: str = Field(description="Estimated speed of selling on Facebook Marketplace in Kansas City metro. One of: hot, normal, slow, very_slow, unknown. See system instructions for criteria.")
     confidence: str = Field(description="One of: high, medium, low, unknown")
-    condition_severity: str = Field(description="One of: pristine, good, flawed, broken_or_unsellable. Use 'broken_or_unsellable' for items where condition makes them worthless on resale market (missing critical parts, hygiene items, expired food, etc). DO NOT mark as broken_or_unsellable if the listing only says condition is unknown — assume it works unless damage is explicitly stated.")
-    repairability: str = Field(description="If condition_severity is 'flawed' or 'broken_or_unsellable', one of: easy_cheap_fix (e.g. missing power cord, missing screws — under $20 to make sellable, considering aftermarket/used/junkyard parts), hard_expensive_fix (e.g. missing proprietary battery, cracked screen), not_applicable (item has no fix issue). The cost benchmark: would the fix cost more than 30% of the resale value? If yes, hard_expensive_fix.")
-    repair_cost_usd: float = Field(description="Realistic $ to make this item sellable — using AFTERMARKET / used / generic / junkyard parts when applicable, NOT OEM list price. Examples: missing power cable → 10. Missing car bumper → 60 (junkyard). Cracked phone screen on $200 used phone → 80. Missing proprietary drone battery → 120. Use 0 if no repair is needed (pristine/good) OR if you set condition_severity=broken_or_unsellable and repairability=hard_expensive_fix (since we'll force resale to $0 in that case).")
-    notes: str = Field(description="Brief caveat or reasoning (1-2 sentences max). Mention the specific fix needed and its rough cost if relevant.")
+    condition: str = Field(description="One of: new, open_box, damaged_easy_fix, damaged_hard_fix. DEFAULT to 'open_box' unless damage is explicitly stated in the listing — see system instructions for the full rules.")
+    notes: str = Field(description="Brief caveat or reasoning (1-2 sentences max). Mention any damage / missing parts that drove the condition assessment.")
 
 
 class BatchResponse(BaseModel):
@@ -109,9 +107,9 @@ For each item, fill in ALL fields:
                      items requiring assembly knowledge.
      • "unknown"   = you genuinely cannot tell what category this is.
 
-   Adjust DOWN one tier if condition_severity is "flawed". Adjust DOWN two
-   tiers if condition_severity is "broken_or_unsellable". Seasonal items
-   (Christmas decor in May, AC units in November) should be one tier slower.
+   Adjust DOWN one tier if condition is "damaged_easy_fix". Adjust DOWN two
+   tiers if condition is "damaged_hard_fix". Seasonal items (Christmas decor
+   in May, AC units in November) should be one tier slower.
 
 4. CONFIDENCE — be honest:
      • "high"   = you know exactly what this product is and its real price
@@ -121,110 +119,89 @@ For each item, fill in ALL fields:
    Use "unknown" liberally rather than fabricating. We'd rather have a missing
    row than a wrong row.
 
-5. CONDITION_SEVERITY — what's the physical state of THIS specific item
-   (read the title and description carefully for damage notes):
-     • "pristine"               = sealed, new, unopened
-     • "good"                   = open box, lightly used, fully functional
-     • "flawed"                 = visible cosmetic damage, scratches, dings,
-                                  but functional
-     • "broken_or_unsellable"   = item won't function as intended on the
-                                  resale market. Examples: hygiene/personal
-                                  care items (used or open), expired food,
-                                  cracked/non-functional electronics,
-                                  prescription items, missing essential parts
-                                  the buyer can't get, custom-engraved
-                                  worthless-to-others items.
+5. CONDITION — what is the physical state of THIS specific item, judged
+   from the title + description + condition note. Pick exactly one:
 
-   IMPORTANT: if the listing only says the condition is "unknown" or
-   "untested" or just doesn't mention the working state at all, ASSUME the
-   item is "good" (functional). Do NOT default to broken_or_unsellable
-   without explicit damage language. Auctioneers leave most items
-   un-tested but the items still usually work fine.
+     • "new"               = explicitly described as new, sealed, unopened,
+                             "in original packaging", "factory sealed",
+                             "brand new", or similar.
 
-6. REPAIRABILITY — only matters if condition_severity is "flawed" or
-   "broken_or_unsellable". The buyer of these items has the help of a
-   competent handyman who can do basic mechanical work, basic cosmetic work
-   (replacing dented body panels, swapping headlight assemblies, replacing
-   broken glass), and basic non-risky electrical work (replacing fuses,
-   wiring outlets, swapping switches). They have a normal toolkit and can
-   source parts from a hardware store, AutoZone, junkyard, eBay, Amazon,
-   or Facebook Marketplace. Assume aftermarket / used / generic / junkyard
-   sources when costing the fix — most flippers don't pay OEM list price.
+     • "open_box"          = THE DEFAULT. Use this whenever the listing
+                             does NOT explicitly describe damage, missing
+                             parts, or non-functioning state. This includes:
+                               - listings that say "open box", "appears new",
+                                 "lightly used", "tested working"
+                               - listings that say nothing about condition
+                               - listings that say condition is "unknown",
+                                 "untested", or "as-is" without further detail
+                             Auctioneers leave most lots untested; assume
+                             they work unless the listing says otherwise.
 
-   What COUNTS as easy_cheap_fix (handyman + cheap parts can handle it):
-     • Missing standard cable (USB-C, HDMI, AC) — under $15
-     • Missing universal power adapter — under $20
-     • Missing screws, knobs, or hardware-store parts
-     • Needs cleaning or replacement gaskets
-     • Missing generic remote control
-     • Missing manual (PDF available online — $0)
-     • Dented car body panel (junkyard replacement: $40–150)
-     • Cracked headlight or fender from a car (junkyard: $30–100)
-     • Cracked glass on furniture, picture frames, cabinet doors
-     • Replacing a worn cord on a lamp or appliance
-     • Replacing a fuse, switch, or outlet
-     • Re-attaching trim, hinges, or cosmetic pieces
-     • Light cleaning of upholstery, sanding/refinishing wood furniture
+     • "damaged_easy_fix"  = listing EXPLICITLY mentions cosmetic damage,
+                             a missing standard part, or a simple problem
+                             that a handyman can handle for under ~$30 in
+                             cheap aftermarket / used / hardware-store parts.
+                             The buyer has a competent handyman who can do
+                             basic mechanical work, basic cosmetic work
+                             (replacing dented body panels, swapping
+                             headlight assemblies, replacing broken glass),
+                             and basic non-risky electrical work (replacing
+                             fuses, wiring outlets, swapping switches).
+                             Examples that BELONG here:
+                               - missing standard cable (USB-C, HDMI, AC)
+                               - missing universal power adapter
+                               - missing screws, knobs, hardware-store parts
+                               - missing generic remote
+                               - missing manual (PDF online)
+                               - dented car body panel, cracked headlight
+                                 (junkyard replacement)
+                               - cracked glass on furniture, picture frames
+                               - worn cord on a lamp or appliance
+                               - replacing a fuse, switch, or outlet
+                               - re-attaching trim, hinges, cosmetic pieces
+                               - light cosmetic wear, scratches, dings
+                                 (still functional)
 
-   What counts as hard_expensive_fix (specialist required, or proprietary
-   parts that can't be sourced cheaply):
-     • Missing PROPRIETARY battery for a specific brand of e-bike, drone,
-       or modern power tool, where even a used aftermarket replacement
-       costs more than 30% of the item's resale value
-     • Cracked LCD/OLED screens on phones, tablets, laptops (requires
-       specialty tools and risk of further damage during the swap)
-     • Internal electronics failure on a sealed unit (motherboard, logic
-       board) where diagnosis is uncertain
-     • Engine, transmission, or drivetrain failure on a vehicle
-     • Refrigerant or sealed-system work on appliances (requires EPA cert)
-     • Soldering or board-level repair
-     • Anything where replacement parts cost > 30% of resale value AND
-       can't be sourced from a junkyard / aftermarket / used market
-     • Missing keys for proprietary locks, safes, or vehicles where a
-       locksmith / dealer is required
-     • Custom-fit or VIN-specific parts not available used
-     • Items whose only fix is "send it in to manufacturer for $X service"
+     • "damaged_hard_fix"  = listing EXPLICITLY indicates the item is
+                             broken, non-functional, or unsellable AND
+                             the fix requires specialist work or expensive
+                             proprietary parts. Examples:
+                               - missing PROPRIETARY battery for an e-bike,
+                                 drone, or modern power tool (no cheap used
+                                 / aftermarket option)
+                               - cracked LCD/OLED screen on phones, tablets,
+                                 laptops
+                               - internal electronics failure on a sealed
+                                 unit (motherboard, logic board)
+                               - engine, transmission, or drivetrain failure
+                               - refrigerant / sealed-system appliance work
+                               - soldering or board-level repair required
+                               - missing keys for proprietary locks, safes,
+                                 or vehicles requiring locksmith / dealer
+                               - custom-fit or VIN-specific parts not
+                                 available used
+                               - "send to manufacturer for $X service"
+                             ALSO use this for items that are fundamentally
+                             unsellable on the resale market regardless of
+                             repair: used hygiene/personal-care items,
+                             expired food, prescription items,
+                             custom-engraved items worthless to others.
 
-   What is "not_applicable":
-     • Item has no condition issue worth fixing (pristine or good)
+   CRITICAL DEFAULTING RULE: When in doubt, choose "open_box". Do NOT
+   guess that an item is damaged. Do NOT mark "damaged_*" just because
+   the listing is vague or says "unknown" / "as-is" / "untested". Only
+   downgrade from "open_box" when the listing has explicit damage,
+   missing-part, or non-functional language. If your confidence on the
+   condition assessment specifically is low, default to "open_box".
 
-   IMPORTANT: items with condition_severity="broken_or_unsellable" AND
-   repairability="hard_expensive_fix" will have their estimated value
-   automatically set to $0. So be honest — flag truly worthless items.
-
-   But ALSO be honest in the other direction: if the only problem is
-   "missing the manual" or "no original box," that is NOT broken_or_unsellable.
-   Cosmetic-only issues are "flawed" + "easy_cheap_fix" or "not_applicable".
-
-7. REPAIR_COST_USD — concrete dollar estimate for PARTS ONLY (assume free
-   handyman labor from the buyer's network), using AFTERMARKET / used /
-   generic / junkyard sources where applicable. This number is folded into
-   the total acquisition cost when computing the deal score, so accuracy
-   matters more than tier labels. Calibration:
-     • Missing standard cable (USB-C, HDMI, AC):     8–12
-     • Missing generic remote:                       12–15
-     • Missing screws/hardware:                      5
-     • Missing universal wall adapter:               10–15
-     • Missing manual:                               0 (PDF online)
-     • Junkyard car bumper / fender / quarter panel: 40–100
-     • Junkyard headlight assembly:                  30–80
-     • Replacement glass for cabinet/picture frame:  10–40
-     • Used proprietary tool battery (DeWalt 20V):   60–120
-     • Used phone screen (mid-tier, DIY kit):        50–90
-     • Drone proprietary battery:                    80–200
-     • Generator carb rebuild kit:                   25–60
-     • Replacement lamp/appliance cord:              5–10
-   Use 0 if condition is pristine/good (no repair needed). Use 0 if you've
-   set condition_severity=broken_or_unsellable AND repairability=
-   hard_expensive_fix (the item gets zeroed out anyway, so the repair
-   cost is moot).
-
-8. NOTES — 1–2 short sentences: identify what you think the item is, mention
-   any specific fix needed and rough cost, or why you're uncertain.
+6. NOTES — 1–2 short sentences: identify what you think the item is,
+   mention any damage / missing parts that drove the condition
+   assessment, or why you're uncertain.
 
 CONSISTENCY CHECK: The notes must agree with the structured fields. Do not
-write "this is unsellable" in notes while assigning a positive resale_pct.
-The structured fields are what get used by downstream code."""
+write "this is broken" in notes while marking it open_box, and do not
+write "appears new" while marking it damaged_hard_fix. The structured
+fields are what get used by downstream code."""
 
 
 # ────────────────────────────── enricher ────────────────────────────────────
