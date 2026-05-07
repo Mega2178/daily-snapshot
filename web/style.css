@@ -89,80 +89,6 @@ html, body {
 .freshness--ancient { background: var(--bad-soft);    border-color: #ecbeb9; color: var(--bad); }
 .freshness--ancient .freshness-dot { background: var(--bad); }
 
-/* ---------- Refresh banner --------------------------------------- */
-
-.refresh-banner {
-  display: flex;
-  align-items: stretch;
-  width: 100%;
-  margin: 0 0 10px;
-  background: linear-gradient(180deg, #1f4d3f 0%, #173a30 100%);
-  color: #fff;
-  border: 1px solid #173a30;
-  border-radius: 8px;
-  overflow: hidden;
-  box-shadow: 0 2px 6px rgba(31, 77, 63, 0.18);
-  transition: box-shadow 0.12s ease;
-}
-.refresh-banner:hover {
-  box-shadow: 0 3px 10px rgba(31, 77, 63, 0.25);
-}
-.refresh-banner__main {
-  flex: 1;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 10px 14px;
-  font: inherit;
-  font-size: 14px;
-  text-align: left;
-  background: transparent;
-  color: inherit;
-  border: none;
-  cursor: pointer;
-}
-.refresh-banner__main:focus-visible {
-  outline: 2px solid #8fd9c0;
-  outline-offset: -3px;
-}
-.refresh-banner__pulse {
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  background: #8fd9c0;
-  box-shadow: 0 0 0 0 rgba(143, 217, 192, 0.7);
-  animation: refresh-pulse 1.6s ease-out infinite;
-  flex-shrink: 0;
-}
-.refresh-banner__text { flex: 1; font-weight: 500; }
-.refresh-banner__cta { font-weight: 600; opacity: 0.95; }
-
-.refresh-banner__dismiss {
-  flex: 0 0 auto;
-  width: 36px;
-  font: inherit;
-  font-size: 22px;
-  line-height: 1;
-  background: transparent;
-  color: rgba(255, 255, 255, 0.85);
-  border: none;
-  border-left: 1px solid rgba(255, 255, 255, 0.15);
-  cursor: pointer;
-  transition: background-color 0.12s ease, color 0.12s ease;
-}
-.refresh-banner__dismiss:hover,
-.refresh-banner__dismiss:focus-visible {
-  background: rgba(255, 255, 255, 0.10);
-  color: #fff;
-  outline: none;
-}
-
-@keyframes refresh-pulse {
-  0%   { box-shadow: 0 0 0 0 rgba(143, 217, 192, 0.7); }
-  70%  { box-shadow: 0 0 0 10px rgba(143, 217, 192, 0); }
-  100% { box-shadow: 0 0 0 0 rgba(143, 217, 192, 0); }
-}
-
 /* ---------- Search row ------------------------------------------- */
 
 .search-row {
@@ -431,7 +357,7 @@ html, body {
 .card-stats {
   margin: 4px 0 0;
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(5, 1fr);
   gap: 6px 8px;
   font-size: 12px;
 }
@@ -475,6 +401,24 @@ html, body {
   overflow: hidden;
   text-overflow: ellipsis;
   max-width: 50%;
+}
+
+/* Location row sits right under the footer divider, slightly de-emphasized.
+   Uses a tiny pin glyph so it reads as "where" without needing an icon font. */
+.card-location {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--ink-faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.card-location:empty { display: none; }
+.card-location::before {
+  content: "📍 ";
+  /* keep it small and not too prominent */
+  font-size: 10px;
+  opacity: 0.7;
 }
 
 /* ---------- Load more -------------------------------------------- */
