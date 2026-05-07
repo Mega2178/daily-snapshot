@@ -53,10 +53,36 @@
     "": 0.0,
   };
 
-  // Purchase-price multiplier mirrors config.PURCHASE_PRICE_MULTIPLIER (request #6).
+  // Purchase-price multiplier mirrors config.PURCHASE_PRICE_MULTIPLIER.
   // The cost to acquire ≈ next_required_bid * 1.3 after fees + tax + premium.
   const PURCHASE_PRICE_MULT = 1.3;
   const HASSLE = 5.0;
+
+  // ─── Condition tiers ────────────────────────────────────────────
+  // Mirrors _condition_resale_factor() in scrape.py. The factor multiplies
+  // estimated_resale: 1.0 for new / open_box (default — no penalty when
+  // condition is unknown or AI confidence is low), 0.85 for damaged_easy_fix
+  // (small "dad can fix it" haircut), 0.0 for damaged_hard_fix (unsellable).
+  // Rank is for the "condition" sort: lower number = better condition.
+  const CONDITION_FACTORS = {
+    new:               1.00,
+    open_box:          1.00,
+    damaged_easy_fix:  0.85,
+    damaged_hard_fix:  0.00,
+  };
+  const CONDITION_RANK = {
+    new:               0,
+    open_box:          1,
+    damaged_easy_fix:  2,
+    damaged_hard_fix:  3,
+  };
+  // Display labels for the condition badge on each card.
+  const CONDITION_LABELS = {
+    new:               "new",
+    open_box:          "open box",
+    damaged_easy_fix:  "easy fix",
+    damaged_hard_fix:  "hard fix",
+  };
 
   // ---- DOM refs ---------------------------------------------------
   const grid           = document.getElementById("grid");
@@ -318,52 +344,50 @@
     return isNaN(n) ? NaN : n * PURCHASE_PRICE_MULT;
   }
 
-  // Estimated $ to make this item sellable. Mirrors _repair_cost() in scrape.py.
-  // Returns the model's number when present, 0 otherwise. Items enriched
-  // before we asked the model for a $ figure show repair=$0 — their flip
-  // scores remain unchanged from the day they were enriched, which is fine
-  // because we don't re-enrich.
-  function repairCostOf(item) {
-    if (item._rc !== undefined) return item._rc;
-    const direct = num(item.ai_repair_cost_usd);
-    item._rc = (!isNaN(direct) && direct >= 0) ? direct : 0;
-    return item._rc;
+  // ─── Condition helpers ──────────────────────────────────────────
+  // Normalize the AI's condition tag. Defaults to "open_box" — that mirrors
+  // the prompt's instruction to default there when the listing is vague,
+  // and means low-confidence / legacy items are NOT penalized at scoring
+  // time. (Old items in raw_items.json predate this field and will fall
+  // through to the default.)
+  function conditionOf(item) {
+    if (item._cond === undefined) {
+      const c = (item.ai_condition || "").trim().toLowerCase();
+      item._cond = (c in CONDITION_FACTORS) ? c : "open_box";
+    }
+    return item._cond;
   }
-
-  // Total acquisition cost: what you actually put in to flip the item.
-  // Folding repair into cost (instead of subtracting from resale) makes
-  // ROI a true "return per dollar invested" — a $10 bid + $50 repair
-  // correctly looks tighter than a $10 bid + $0 repair for the same resale.
-  function totalCostOf(item) {
-    if (item._tc !== undefined) return item._tc;
-    const purchase = purchasePriceNum(item);
-    if (isNaN(purchase)) { item._tc = NaN; return NaN; }
-    item._tc = purchase + repairCostOf(item);
-    return item._tc;
+  function conditionFactorOf(item) {
+    return CONDITION_FACTORS[conditionOf(item)];
+  }
+  function conditionRankOf(item) {
+    return CONDITION_RANK[conditionOf(item)];
   }
 
   // Recompute flip score (ROI) from raw fields. Stays in sync with
   // compute_flip_score() in scrape.py — same purchase-price model and
-  // same repair-as-cost treatment.
+  // same condition-as-resale-multiplier treatment.
   function computeFlipScore(item) {
     const resale = num(item.ai_estimated_resale);
-    const total  = totalCostOf(item);
-    if (isNaN(resale) || isNaN(total) || resale <= 0) return NaN;
-    const denom = Math.max(total, 1.0);
-    return (resale - total - HASSLE) / denom;
+    const purchase = purchasePriceNum(item);
+    if (isNaN(resale) || isNaN(purchase) || resale <= 0) return NaN;
+    const effectiveResale = resale * conditionFactorOf(item);
+    const denom = Math.max(purchase, 1.0);
+    return (effectiveResale - purchase - HASSLE) / denom;
   }
   function flipScoreOf(item) {
     if (item._fs === undefined) item._fs = computeFlipScore(item);
     return item._fs;
   }
 
-  // Gross profit in dollars: resale - total_cost - hassle.
+  // Gross profit in dollars: effective_resale - purchase - hassle.
   // Same numerator as flip_score; differs only in normalization.
   function computeGrossProfit(item) {
     const resale = num(item.ai_estimated_resale);
-    const total  = totalCostOf(item);
-    if (isNaN(resale) || isNaN(total) || resale <= 0) return NaN;
-    return resale - total - HASSLE;
+    const purchase = purchasePriceNum(item);
+    if (isNaN(resale) || isNaN(purchase) || resale <= 0) return NaN;
+    const effectiveResale = resale * conditionFactorOf(item);
+    return effectiveResale - purchase - HASSLE;
   }
   function grossProfitOf(item) {
     if (item._gp === undefined) item._gp = computeGrossProfit(item);
@@ -458,90 +482,89 @@
   // Build search-term regexes from the user's query.
   //
   // We split on whitespace and require ALL terms to match (AND semantics, so
-  // "leaf blower" finds items mentioning both, in any order). Each term must
-  // appear at a WORD BOUNDARY in the haystack. That's the fix for the bug
-  // where searching "hat" returned every item whose AI notes contained
-  // "that" or "what".
+  // "leaf blower" finds items mentioning both, in any order). For each term
+  // we precompile TWO regexes:
+  //   - reWord:   \bTERM\b — whole-word match (the gold-standard hit:
+  //               "car" matches "Car Battery" but not "Carpet")
+  //   - rePrefix: \bTERM   — word-start match ("car" matches "Carpet" too,
+  //               and "hammer" matches "hammers" — useful for plurals)
   //
-  // We use \b<term> (word-start), not \b<term>\b (whole-word), so that
-  // typing "hammer" still matches "hammers" / "hammered". The tradeoff:
-  // "saw" no longer matches inside "chainsaw" — typically what people want.
+  // An item passes the filter if every term hits at least at the prefix
+  // level, somewhere (title or body). The ranking tier (below) decides
+  // WHERE in the results that item lands.
   //
-  // Special chars in the query are escaped so a query like "3.5mm" doesn't
-  // get parsed as regex syntax.
+  // Special chars are escaped so a query like "3.5mm" doesn't get parsed
+  // as regex syntax.
   function buildSearchTerms(query) {
     if (!query) return null;
     const terms = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
     if (terms.length === 0) return null;
-    return terms.map((t) => ({
-      raw: t,
-      // Word-start regex: matches "hammer" inside "hammers" but not inside
-      // "sledgehammer". This is the same pattern that was here before.
-      re: new RegExp("\\b" + escapeRegex(t)),
-    }));
+    return terms.map((t) => {
+      const esc = escapeRegex(t);
+      return {
+        raw: t,
+        reWord:   new RegExp("\\b" + esc + "\\b"),
+        rePrefix: new RegExp("\\b" + esc),
+      };
+    });
   }
   function escapeRegex(s) {
     return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   }
 
-  // Filter test: does this item pass the search? We require EVERY term to
-  // appear SOMEWHERE — title or body — at a word boundary. The relevance
-  // score (below) decides where it ranks among the survivors.
+  // Filter test: does this item pass the search?
+  // Every term must match SOMEWHERE — title or body — at least at the
+  // prefix level. The relevance tier (below) decides ranking among the
+  // survivors.
   function matchesSearch(item, terms) {
     if (!terms) return true;
     const titleHay = titleHayOf(item);
     const bodyHay = bodyHayOf(item);
     for (let i = 0; i < terms.length; i++) {
-      if (!terms[i].re.test(titleHay) && !terms[i].re.test(bodyHay)) return false;
+      const t = terms[i];
+      if (!t.rePrefix.test(titleHay) && !t.rePrefix.test(bodyHay)) return false;
     }
     return true;
   }
 
-  // Relevance score for ranking search hits. Higher = better.
-  // The score is constructed so that ALL items matching in title rank above
-  // ANY item matching only in body, regardless of how many body hits the
-  // body-only item has. That's the user's #3: "if the title has the searched
-  // word, it goes up; the random bs goes near the bottom."
+  // Per-term tier (lower number = better match). Tiers are deliberately
+  // discrete so ranking GROUPS items into bands rather than mixing them:
+  //   1: title whole-word     ("car" in "Car Battery")
+  //   2: title prefix only    ("car" in "Carpet Cleaner" — also "Cars")
+  //   3: body whole-word      ("car" as a standalone word in notes)
+  //   4: body prefix only     ("car" inside "Carpet" appears in body)
+  //   99: no match            (filtered out before we score)
+  function termTier(term, titleHay, bodyHay) {
+    if (term.reWord.test(titleHay))   return 1;
+    if (term.rePrefix.test(titleHay)) return 2;
+    if (term.reWord.test(bodyHay))    return 3;
+    if (term.rePrefix.test(bodyHay))  return 4;
+    return 99;
+  }
+
+  // Item-level tier across all search terms = the WORST per-term tier
+  // ("weakest link" rule). Searching "car battery":
+  //   • both terms title-whole-word → item tier 1 (best)
+  //   • "car" title-WW, "battery" title-prefix → item tier 2
+  //   • "car" title-WW, "battery" body-WW → item tier 3
+  // This gives clean groups: ALL tier-1 items rank above ALL tier-2 items,
+  // regardless of how many terms hit. Within a tier, the user's chosen
+  // sort (smart score, ROI, etc.) breaks the tie.
   //
-  // Per-term contribution:
-  //   • title startsWith term:    1000 (exact prefix — "car" matches "Car Stereo...")
-  //   • title contains term word: 500  ("car" in "...New Car Battery...")
-  //   • title contains term substr: 200 ("car" in "Carpet Cleaner")
-  //   • body word match:          10
-  //   • body substring match:     1
-  //   • no match for this term:   we'd already be filtered out
-  //
-  // Multi-term queries sum each term's score. So "car battery" giving 1000+500
-  // (title prefix on "car", title word on "battery") beats 200+10 from a body match.
-  function searchRelevance(item, terms) {
-    if (!terms) return 0;
-    let score = 0;
+  // Cached per render-pass via the terms object identity (terms is rebuilt
+  // every render() call, so a stale cache can't survive across renders).
+  function searchTierOf(item, terms) {
+    if (item._tierTerms === terms) return item._tier;
     const titleHay = titleHayOf(item);
     const bodyHay = bodyHayOf(item);
+    let worst = 0;
     for (let i = 0; i < terms.length; i++) {
-      const t = terms[i];
-      if (titleHay.startsWith(t.raw)) {
-        score += 1000;
-      } else if (t.re.test(titleHay)) {
-        score += 500;
-      } else if (titleHay.indexOf(t.raw) !== -1) {
-        score += 200;
-      } else if (t.re.test(bodyHay)) {
-        score += 10;
-      } else if (bodyHay.indexOf(t.raw) !== -1) {
-        score += 1;
-      }
+      const t = termTier(terms[i], titleHay, bodyHay);
+      if (t > worst) worst = t;
     }
-    return score;
-  }
-  function relevanceOf(item, terms) {
-    // Cache only when terms object hasn't changed — terms is rebuilt on every
-    // render() call so we tag it with a render-scoped marker.
-    if (item._relTerms !== terms) {
-      item._rel = searchRelevance(item, terms);
-      item._relTerms = terms;
-    }
-    return item._rel;
+    item._tier = worst;
+    item._tierTerms = terms;
+    return worst;
   }
 
   // ---- Sort comparators ------------------------------------------
@@ -571,6 +594,7 @@
     gross_profit: descBy(grossProfitOf),
     current_bid:  ascBy(nextBidNum),
     closing_time: ascBy(closingMs),
+    condition:    ascBy(conditionRankOf),  // best condition first (rank 0 = new)
     title: (a, b) =>
       (a.title || "").localeCompare(b.title || "", undefined, { sensitivity: "base" }),
   };
@@ -604,16 +628,18 @@
       return f >= minFlip;
     });
 
-    // When a search is active, rank by relevance FIRST, then by the user's
-    // chosen sort as a tiebreaker. This way "car" surfaces title-matching
-    // items before body-matching ones, but within each relevance tier we
-    // still order by smart score / ROI / closing time / etc.
+    // When a search is active, GROUP results by relevance tier first, then
+    // apply the user's chosen sort within each group. So "car" surfaces all
+    // title-whole-word matches first (sorted by smart score / ROI / etc.),
+    // then all title-prefix matches, then body matches — clean bands rather
+    // than a continuous gradient. Within each band, filters and sort behave
+    // exactly like the no-search case.
     const baseCmp = COMPARATORS[sortBy] || COMPARATORS.smart;
     if (terms) {
       filteredItems.sort((a, b) => {
-        const ra = relevanceOf(a, terms);
-        const rb = relevanceOf(b, terms);
-        if (rb !== ra) return rb - ra;   // higher relevance first
+        const ta = searchTierOf(a, terms);
+        const tb = searchTierOf(b, terms);
+        if (ta !== tb) return ta - tb;   // lower tier number = better match, comes first
         return baseCmp(a, b);
       });
     } else {
@@ -718,8 +744,9 @@
       scoreEl.textContent = f.toFixed(2) + "×";
       scoreEl.title =
         `ROI: ${f.toFixed(2)}× — ` +
-        `(resale − total cost − $${HASSLE.toFixed(0)} hassle) ÷ total cost. ` +
-        `Total cost = (next bid × ${PURCHASE_PRICE_MULT.toFixed(1)}) + repair cost.`;
+        `(effective resale − cost − $${HASSLE.toFixed(0)} hassle) ÷ cost. ` +
+        `Cost = next bid × ${PURCHASE_PRICE_MULT.toFixed(1)}. ` +
+        `Effective resale = est. resale × condition factor.`;
     }
 
     // Gross profit badge ($)
@@ -753,32 +780,33 @@
       confEl.textContent = item.ai_confidence;
     }
 
+    // Condition badge — renders only when the AI tagged the item with a
+    // recognized condition. Empty/unknown leaves the badge collapsed via
+    // the :empty CSS rule, so legacy items without ai_condition show no
+    // condition badge at all (rather than a misleading "open box" label
+    // we never actually computed).
+    const condEl = node.querySelector('[data-role="condition"]');
+    if (condEl) {
+      const rawCond = (item.ai_condition || "").trim().toLowerCase();
+      if (rawCond && rawCond in CONDITION_LABELS) {
+        condEl.textContent = CONDITION_LABELS[rawCond];
+        condEl.setAttribute("data-condition", rawCond);
+        condEl.title = `AI-assessed condition: ${CONDITION_LABELS[rawCond]}`;
+      } else {
+        condEl.textContent = "";
+      }
+    }
+
     // Title
     node.querySelector('[data-role="title"]').textContent = item.title || "(untitled)";
 
-    // Stats: bid, purchase cost (×1.3), repair, resale, retail
+    // Stats: bid, purchase cost (×1.3), resale, retail
     node.querySelector('[data-role="bid"]').textContent = item.current_bid || "—";
     const costEl = node.querySelector('[data-role="purchase-price"]');
     if (costEl) {
       const cost = purchasePriceNum(item);
       costEl.textContent = isNaN(cost) ? "—" : "$" + cost.toFixed(2);
       costEl.title = "Realistic out-of-pocket: next required bid × 1.3 (fees + tax)";
-    }
-    const repairEl = node.querySelector('[data-role="repair"]');
-    if (repairEl) {
-      const r = repairCostOf(item);
-      // Show "—" for zero so the stat visually fades out for items with no
-      // condition issue. Anything > 0 shows the dollar amount the model
-      // estimated for parts (handyman labor assumed free).
-      if (r > 0) {
-        repairEl.textContent = "$" + r.toFixed(2);
-        repairEl.title =
-          "Estimated parts cost to make this sellable. Aftermarket / used / " +
-          "junkyard sources assumed; handyman labor assumed free.";
-      } else {
-        repairEl.textContent = "—";
-        repairEl.title = "No repair needed";
-      }
     }
     const resale = num(item.ai_estimated_resale);
     node.querySelector('[data-role="resale"]').textContent =
