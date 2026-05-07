@@ -56,10 +56,8 @@ CSV_FIELDS = [
     "ai_resale_pct",
     "ai_confidence",
     "ai_sales_velocity",     # hot / normal / slow / very_slow / unknown
-    "ai_condition_severity", # pristine / good / flawed / broken_or_unsellable
-    "ai_repairability",      # easy_cheap_fix / hard_expensive_fix / not_applicable
-    "ai_repair_cost_usd",    # estimated $ to fix (aftermarket parts OK), 0 if no repair needed
-    "value_overridden",      # "yes" if we forced resale to $0
+    "ai_condition",          # new / open_box / damaged_easy_fix / damaged_hard_fix
+    "value_overridden",      # "yes" if we forced resale to $0 (damaged_hard_fix)
     "title",
     "location",              # "City, ST" of the auction house
     "ai_notes",
@@ -356,26 +354,19 @@ def do_enrich(items: dict[str, Item], limit: int | None = None) -> dict[str, Ite
             it.ai_resale_pct = f"{v.resale_pct:.2f}"
             estimated_resale = v.current_retail_usd * v.resale_pct
             it.ai_confidence = v.confidence
-            it.ai_condition_severity = v.condition_severity
-            it.ai_repairability = v.repairability
-            it.ai_repair_cost_usd = f"{v.repair_cost_usd:.2f}"
+            it.ai_condition = v.condition
             it.ai_sales_velocity = v.sales_velocity
 
             # ── Deterministic override for unsellable items ──
-            # Only force resale to $0 when the model says BOTH "broken_or_
-            # unsellable" AND "hard_expensive_fix". The smarter penalty for
-            # mid-range cases (broken + cheap fix, or flawed + expensive fix)
-            # comes from folding repair_cost_usd into the cost denominator.
-            # That preserves the missing-power-cable projector case the user
-            # called out: easy_cheap_fix items keep most of their value;
-            # only the truly-worthless category zeroes out.
-            if (v.condition_severity == "broken_or_unsellable"
-                    and v.repairability == "hard_expensive_fix"):
+            # Force resale to $0 ONLY when the model says "damaged_hard_fix"
+            # — that tier covers both "broken and impossible to fix
+            # affordably" and "fundamentally unsellable" (used hygiene,
+            # expired food, etc). Items with cheap-and-easy fixes
+            # (damaged_easy_fix) are NOT zeroed out — they get a small
+            # haircut at scoring time instead, which preserves the
+            # missing-power-cable projector case.
+            if v.condition == "damaged_hard_fix":
                 estimated_resale = 0.0
-                # Also zero the repair cost — no point "spending" on parts
-                # for an item we've decided is worthless. Otherwise gross
-                # profit would show as -repair_cost, which is misleading.
-                it.ai_repair_cost_usd = "0.00"
                 it.value_overridden = "yes"
             else:
                 it.value_overridden = ""
@@ -419,42 +410,50 @@ def _purchase_price(it: Item) -> float | None:
     return bid * config.PURCHASE_PRICE_MULTIPLIER
 
 
-def _repair_cost(it: Item) -> float:
-    """Estimated $ to make this item sellable.
+def _condition_resale_factor(it: Item) -> float:
+    """Multiplier applied to estimated_resale based on AI-assessed condition.
 
-    Only returns a number when the model gave us one (ai_repair_cost_usd is
-    populated). For legacy items enriched before we asked the model for a
-    dollar amount, we return 0 — those items already got their flip_score
-    written at enrichment time and we don't re-enrich. Going forward, every
-    NEW item gets a real repair-cost estimate from Gemini.
+    Replaces the old "fold repair cost into total cost" approach. The
+    condition field is a tier label (new / open_box / damaged_easy_fix /
+    damaged_hard_fix), not a dollar amount, so we scale resale instead of
+    adding to cost:
 
-    Aftermarket / used / junkyard sources are assumed in the model's
-    estimate (see the prompt). A handyman with normal tools — basic
-    mechanical, cosmetic, light electrical — is the assumed labor.
+      • new              → 1.00  (no haircut)
+      • open_box         → 1.00  (no haircut — this is the default)
+      • damaged_easy_fix → 0.85  (small haircut: dad can fix it cheap, but
+                                   buyer will still discount slightly)
+      • damaged_hard_fix → 0.00  (already zeroed at enrichment time via
+                                   value_overridden, but we belt-and-
+                                   suspenders here for legacy items)
+      • anything else / empty → 1.00 (default — never penalize for missing
+                                       data; matches "don't guess if
+                                       confidence is low")
+
+    Low-confidence enrichments naturally land on "open_box" (the prompt
+    tells the model to default there when it can't tell), so this factor
+    only ever moves the score for items the model felt good about.
     """
-    if not it.ai_repair_cost_usd:
+    cond = (it.ai_condition or "").strip().lower()
+    if cond == "damaged_hard_fix":
         return 0.0
-    try:
-        cost = float(it.ai_repair_cost_usd)
-        return cost if cost >= 0 else 0.0
-    except (ValueError, TypeError):
-        return 0.0
+    if cond == "damaged_easy_fix":
+        return 0.85
+    # new, open_box, empty/unknown all keep full resale
+    return 1.0
 
 
 def compute_flip_score(it: Item) -> str:
     """flip_score (ROI) =
-        (estimated_resale - total_cost - hassle) / total_cost
-    where total_cost = purchase_price + repair_cost.
+        (effective_resale - purchase_price - hassle) / purchase_price
 
     purchase_price = next_required_bid * PURCHASE_PRICE_MULTIPLIER, which models
     buyer's premium + tax + fees. The bid alone underestimates real cost by
     roughly 30%.
 
-    repair_cost is the model's estimate of what it takes to make the item
-    sellable — aftermarket parts, junkyard pulls, generic replacements.
-    Folding it into total cost (instead of subtracting it from resale) means
-    a $10 bid + $50 repair correctly ranks below a $10 bid + $0 repair when
-    measured as "ROI per dollar I actually put in."
+    effective_resale = estimated_resale * condition_resale_factor. The
+    factor is 1.0 for new / open_box (default), 0.85 for damaged_easy_fix
+    (small handyman-fix haircut), and 0.0 for damaged_hard_fix (already
+    zeroed at enrichment, this is just defense-in-depth).
 
     Returns a string. Empty if unknown / can't compute.
     """
@@ -467,10 +466,9 @@ def compute_flip_score(it: Item) -> str:
         purchase_price = _purchase_price(it)
         if purchase_price is None:
             return ""
-        repair_cost = _repair_cost(it)
-        total_cost = purchase_price + repair_cost
-        cost_floor = max(total_cost, 1.0)
-        score = (estimated_resale - total_cost - config.PICKUP_HASSLE_DOLLARS) / cost_floor
+        effective_resale = estimated_resale * _condition_resale_factor(it)
+        cost_floor = max(purchase_price, 1.0)
+        score = (effective_resale - purchase_price - config.PICKUP_HASSLE_DOLLARS) / cost_floor
         return f"{score:.2f}"
     except (ValueError, TypeError):
         return ""
@@ -478,10 +476,9 @@ def compute_flip_score(it: Item) -> str:
 
 def compute_gross_profit(it: Item) -> str:
     """Absolute dollar profit:
-        estimated_resale - purchase_price - repair_cost - hassle.
+        effective_resale - purchase_price - hassle.
 
-    Same as flip_score's numerator. The denominator is what differs (gross
-    profit is in dollars, not a ratio).
+    Same numerator as flip_score; differs only in normalization.
 
     Returns a string. Empty if unknown / can't compute.
     """
@@ -494,10 +491,9 @@ def compute_gross_profit(it: Item) -> str:
         purchase_price = _purchase_price(it)
         if purchase_price is None:
             return ""
-        repair_cost = _repair_cost(it)
-        profit = (estimated_resale
+        effective_resale = estimated_resale * _condition_resale_factor(it)
+        profit = (effective_resale
                   - purchase_price
-                  - repair_cost
                   - config.PICKUP_HASSLE_DOLLARS)
         return f"{profit:.2f}"
     except (ValueError, TypeError):
