@@ -14,7 +14,7 @@
 // Bump CACHE_VERSION whenever you change app.js, index.html, or style.css
 // so old clients pick up the new code on next reload.
 
-const CACHE_VERSION = "v5";
+const CACHE_VERSION = "v6";
 const STATIC_CACHE  = `static-${CACHE_VERSION}`;
 const DATA_CACHE    = `data-${CACHE_VERSION}`;
 
@@ -69,10 +69,12 @@ self.addEventListener("activate", (event) => {
   self.clients.claim();
 });
 
-// ---- message: SKIP_WAITING handler -----------------------------
-// The page (app.js refresh handler) sends this when the user clicks the
-// "New snapshot available — Refresh" banner AND a new SW version is waiting.
-// We promote the waiting worker so it takes control on the next reload.
+// ---- message: legacy SKIP_WAITING handler ---------------------
+// We removed the in-page "new snapshot" refresh banner that used to post
+// SKIP_WAITING here. The handler stays as a no-op safety net so any old
+// app.js still running in a tab can promote a new SW cleanly during the
+// rollover instead of hanging on the previous version. Once everyone has
+// reloaded onto v6+ this can be deleted entirely.
 self.addEventListener("message", (event) => {
   if (event.data && event.data.type === "SKIP_WAITING") {
     self.skipWaiting();
