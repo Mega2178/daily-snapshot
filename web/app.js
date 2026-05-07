@@ -63,18 +63,11 @@
   // estimated_resale: 1.0 for new / open_box (default — no penalty when
   // condition is unknown or AI confidence is low), 0.85 for damaged_easy_fix
   // (small "dad can fix it" haircut), 0.0 for damaged_hard_fix (unsellable).
-  // Rank is for the "condition" sort: lower number = better condition.
   const CONDITION_FACTORS = {
     new:               1.00,
     open_box:          1.00,
     damaged_easy_fix:  0.85,
     damaged_hard_fix:  0.00,
-  };
-  const CONDITION_RANK = {
-    new:               0,
-    open_box:          1,
-    damaged_easy_fix:  2,
-    damaged_hard_fix:  3,
   };
   // Display labels for the condition badge on each card.
   const CONDITION_LABELS = {
@@ -88,6 +81,7 @@
   const grid           = document.getElementById("grid");
   const sortSel        = document.getElementById("sort");
   const velocitySel    = document.getElementById("velocity");
+  const conditionSel   = document.getElementById("condition");
   const minFlipInput   = document.getElementById("min-flip");
   const minFlipValue   = document.getElementById("min-flip-value");
   const searchInput    = document.getElementById("search");
@@ -181,6 +175,10 @@
         const opt = velocitySel.querySelector(`option[value="${pendingRestore.velocity}"]`);
         if (opt) velocitySel.value = pendingRestore.velocity;
       }
+      if (typeof pendingRestore.condition === "string") {
+        const opt = conditionSel.querySelector(`option[value="${pendingRestore.condition}"]`);
+        if (opt) conditionSel.value = pendingRestore.condition;
+      }
       if (typeof pendingRestore.minFlip === "number") {
         minFlipInput.value = String(pendingRestore.minFlip);
       }
@@ -193,6 +191,7 @@
 
     sortSel.addEventListener("change", () => { render(); saveStateSoon(); });
     velocitySel.addEventListener("change", () => { render(); saveStateSoon(); });
+    conditionSel.addEventListener("change", () => { render(); saveStateSoon(); });
     minFlipInput.addEventListener("input", () => {
       minFlipValue.textContent = parseFloat(minFlipInput.value).toFixed(1);
       render();
@@ -238,6 +237,7 @@
         v: STATE_VERSION,
         sort: sortSel.value,
         velocity: velocitySel.value,
+        condition: conditionSel.value,
         minFlip: parseFloat(minFlipInput.value),
         search: searchInput.value,
         renderedCount: renderedCount,
@@ -359,9 +359,6 @@
   }
   function conditionFactorOf(item) {
     return CONDITION_FACTORS[conditionOf(item)];
-  }
-  function conditionRankOf(item) {
-    return CONDITION_RANK[conditionOf(item)];
   }
 
   // Recompute flip score (ROI) from raw fields. Stays in sync with
@@ -594,7 +591,6 @@
     gross_profit: descBy(grossProfitOf),
     current_bid:  ascBy(nextBidNum),
     closing_time: ascBy(closingMs),
-    condition:    ascBy(conditionRankOf),  // best condition first (rank 0 = new)
     title: (a, b) =>
       (a.title || "").localeCompare(b.title || "", undefined, { sensitivity: "base" }),
   };
@@ -609,12 +605,29 @@
     return true;
   }
 
+  // ---- Condition filter ------------------------------------------
+  // Symmetric with the velocity filter. Uses conditionOf() — which defaults
+  // empty/unknown to "open_box" — so legacy items without ai_condition land
+  // in the "open box" bucket and are NOT filtered out by "New or open box"
+  // or "Exclude hard fix". They WILL be filtered out by "New only", which
+  // matches user intent (if they ask for sealed-only, legacy unknowns
+  // shouldn't slip through).
+  function passesConditionFilter(item, mode) {
+    if (mode === "any") return true;
+    const c = conditionOf(item);
+    if (mode === "new")              return c === "new";
+    if (mode === "new_or_open_box")  return c === "new" || c === "open_box";
+    if (mode === "exclude_hard_fix") return c !== "damaged_hard_fix";
+    return true;
+  }
+
   // ---- Render -----------------------------------------------------
   function render() {
-    const minFlip      = parseFloat(minFlipInput.value);
-    const sortBy       = sortSel.value;
-    const velocityMode = velocitySel.value;
-    const terms        = buildSearchTerms(searchQueryNorm);
+    const minFlip       = parseFloat(minFlipInput.value);
+    const sortBy        = sortSel.value;
+    const velocityMode  = velocitySel.value;
+    const conditionMode = conditionSel.value;
+    const terms         = buildSearchTerms(searchQueryNorm);
 
     filteredItems = allItems.filter((it) => {
       // Closed items are NEVER shown — they're not actionable. The "Show
@@ -622,6 +635,7 @@
       // lots they can browse the source site directly.
       if (isClosed(it)) return false;
       if (!passesVelocityFilter(it, velocityMode)) return false;
+      if (!passesConditionFilter(it, conditionMode)) return false;
       if (!matchesSearch(it, terms)) return false;
       const f = flipScoreOf(it);
       if (isNaN(f)) return minFlip === 0;
@@ -664,6 +678,7 @@
       if (searchQueryNorm) reasons.push("clear the search");
       if (minFlip > 0) reasons.push("lower the min flip score");
       if (velocityMode !== "any") reasons.push("change Velocity to Any");
+      if (conditionMode !== "any") reasons.push("change Condition to Any");
       const hint = reasons.length
         ? `Try ${reasons.join(" or ")} to see more.`
         : "There are no open items in the data file.";
