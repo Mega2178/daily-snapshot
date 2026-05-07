@@ -332,6 +332,41 @@ html, body {
   color: var(--ink-faint);
   text-decoration: line-through;
 }
+.badge--condition {
+  border: 1px solid var(--rule);
+  font-weight: 500;
+  text-transform: lowercase;
+  background: var(--surface);
+  color: var(--ink-muted);
+}
+.badge--condition:empty { display: none; }
+/* "new" — best condition, sealed/factory new */
+.badge--condition[data-condition="new"] {
+  background: var(--accent-soft);
+  border-color: #cfe0d6;
+  color: var(--accent);
+}
+/* "open box" — the default; intentionally low-contrast so it doesn't
+   visually shout on most cards (most items land here). */
+.badge--condition[data-condition="open_box"] {
+  background: var(--surface);
+  border-color: var(--rule);
+  color: var(--ink-muted);
+}
+/* "easy fix" — small handyman job; warm tone, not alarming */
+.badge--condition[data-condition="damaged_easy_fix"] {
+  background: var(--warn-soft);
+  border-color: #ead8b0;
+  color: var(--warn);
+}
+/* "hard fix" — broken / unsellable; strong warning tone + strikethrough so
+   it reads as "stay away" at a glance */
+.badge--condition[data-condition="damaged_hard_fix"] {
+  background: var(--bad-soft);
+  border-color: #ecbeb9;
+  color: var(--bad);
+  text-decoration: line-through;
+}
 .badge--confidence {
   background: transparent;
   color: var(--ink-muted);
@@ -357,7 +392,7 @@ html, body {
 .card-stats {
   margin: 4px 0 0;
   display: grid;
-  grid-template-columns: repeat(5, 1fr);
+  grid-template-columns: repeat(4, 1fr);
   gap: 6px 8px;
   font-size: 12px;
 }
