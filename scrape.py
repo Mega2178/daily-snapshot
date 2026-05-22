@@ -18,7 +18,7 @@ import csv
 import json
 import sys
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import config
@@ -100,7 +100,13 @@ def load_existing() -> dict[str, Item]:
 
 def save_raw(items: dict[str, Item]) -> None:
     with RAW_PATH.open("w", encoding="utf-8") as f:
-        json.dump([asdict(it) for it in items.values()], f, indent=2)
+        # Same compactness logic as web/data/items.json — saves a third
+        # of the file size, well worth the loss of git-diff readability.
+        if config.PRETTY_PRINT_JSON:
+            json.dump([asdict(it) for it in items.values()], f, indent=2)
+        else:
+            json.dump([asdict(it) for it in items.values()], f,
+                      separators=(",", ":"))
 
 
 def _iso_to_cst_12h(iso_str: str) -> str:
@@ -197,7 +203,13 @@ def write_json(items: dict[str, Item]) -> None:
 
     JSON_PATH.parent.mkdir(parents=True, exist_ok=True)
     with JSON_PATH.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
+        # PRETTY_PRINT_JSON=False (the default) writes single-line JSON,
+        # roughly 30% smaller. The frontend doesn't care. GitHub has a
+        # 100 MB hard file limit, so every byte counts here.
+        if config.PRETTY_PRINT_JSON:
+            json.dump(payload, f, indent=2)
+        else:
+            json.dump(payload, f, separators=(",", ":"))
 
 
 # ────────────────────────────── pipeline steps ──────────────────────────────
@@ -207,12 +219,20 @@ def do_scrape(existing: dict[str, Item], limit: int | None = None) -> dict[str, 
 
     Bids on previously-seen items are refreshed; AI fields are preserved.
 
+    Newly-discovered items also get a per-item detail-page fetch (when
+    config.SCRAPE_ITEM_DETAIL_PAGES is True) — that's where the real
+    "Description:" and "Additional Detail:" text lives, which feeds the
+    AI's condition assessment.
+
     If `limit` is not None, stop after processing that many items from the
     crawl (counting both new and refreshed). Used by --test mode to keep
     runs short. The cap is on items *yielded by crawl_all*, not on new
     items only — that way the test mode is predictable whether the cache
     is empty or already populated.
     """
+    import time as _time  # local alias to avoid clashing with module-level imports
+    from scraper import fetch_item_detail  # lazy import to avoid circular ref
+
     print("\n=== SCRAPE ===")
     if limit is not None:
         print(f"  (test mode: capped at {limit} items)")
@@ -220,6 +240,10 @@ def do_scrape(existing: dict[str, Item], limit: int | None = None) -> dict[str, 
     new_count = 0
     refresh_count = 0
     processed = 0
+    detail_fetched = 0
+    detail_skipped_budget = 0
+    detail_budget_start = _time.time()
+    detail_budget_exceeded = False
 
     for fresh in crawl_all(session):
         key = fresh.key()
@@ -234,16 +258,56 @@ def do_scrape(existing: dict[str, Item], limit: int | None = None) -> dict[str, 
             old.next_required_bid = fresh.next_required_bid
             old.time_remaining = fresh.time_remaining
             old.closing_time_raw = fresh.closing_time_raw
+            # CRITICAL: re-parse closing_time_iso every refresh.
+            # The raw text can be "Today 05:30 pm CDT" — relative to the
+            # day of the scrape. If an item was first cached when it said
+            # "Tomorrow", and we never re-parse, the stored ISO is forever
+            # stamped as the wrong calendar day. Re-parsing on every refresh
+            # converts the current "Today/Tomorrow" against the current
+            # wall-clock date, which is always right. Items whose raw text
+            # has an explicit MM/DD/YYYY are unaffected (idempotent re-parse).
+            old.closing_time_iso = fresh.closing_time_iso
             old.scraped_at = fresh.scraped_at
             # Backfill location for items cached before we started scraping it.
             # Don't overwrite if we already have one — keeps things stable
             # if a single re-scrape misses the auction-house header for any reason.
             if fresh.location and not old.location:
                 old.location = fresh.location
+            # Backfill detail-page data for items cached before we started
+            # fetching it. Only when the toggle is on and we haven't already
+            # tried this item.
+            if (config.SCRAPE_ITEM_DETAIL_PAGES
+                    and not old.description_enriched
+                    and not detail_budget_exceeded):
+                elapsed = _time.time() - detail_budget_start
+                if elapsed > config.SCRAPE_DETAIL_PAGE_TIME_BUDGET_SECONDS:
+                    detail_budget_exceeded = True
+                    print(f"  ! detail-page time budget "
+                          f"({config.SCRAPE_DETAIL_PAGE_TIME_BUDGET_SECONDS}s) "
+                          f"exceeded; remaining items will enrich on title only")
+                else:
+                    fetch_item_detail(session, old)
+                    detail_fetched += 1
+            elif config.SCRAPE_ITEM_DETAIL_PAGES and not old.description_enriched:
+                detail_skipped_budget += 1
             refresh_count += 1
         else:
             existing[key] = fresh
             new_count += 1
+            # Brand-new item — fetch its detail page now while we're crawling
+            if (config.SCRAPE_ITEM_DETAIL_PAGES
+                    and not detail_budget_exceeded):
+                elapsed = _time.time() - detail_budget_start
+                if elapsed > config.SCRAPE_DETAIL_PAGE_TIME_BUDGET_SECONDS:
+                    detail_budget_exceeded = True
+                    print(f"  ! detail-page time budget "
+                          f"({config.SCRAPE_DETAIL_PAGE_TIME_BUDGET_SECONDS}s) "
+                          f"exceeded; remaining new items will enrich on title only")
+                else:
+                    fetch_item_detail(session, fresh)
+                    detail_fetched += 1
+            elif config.SCRAPE_ITEM_DETAIL_PAGES:
+                detail_skipped_budget += 1
 
         processed += 1
         if processed % 100 == 0:
@@ -259,6 +323,10 @@ def do_scrape(existing: dict[str, Item], limit: int | None = None) -> dict[str, 
 
     print(f"\n→ {new_count} new items, {refresh_count} refreshed, "
           f"{len(existing)} total in dataset")
+    if config.SCRAPE_ITEM_DETAIL_PAGES:
+        print(f"  detail pages fetched: {detail_fetched}"
+              + (f", skipped (budget): {detail_skipped_budget}"
+                 if detail_skipped_budget else ""))
     return existing
 
 
@@ -278,17 +346,57 @@ def _is_closed(it: Item) -> bool:
     return close <= datetime.now(timezone.utc)
 
 
+def purge_stale_items(items: dict[str, Item]) -> int:
+    """Drop items whose auctions closed more than CLOSED_ITEM_RETENTION_DAYS ago.
+
+    Why: GitHub rejects pushes when any file exceeds 100 MB. At ~3,000-6,000
+    new items per day, the JSON cache crosses 100 MB in ~3-4 weeks if we
+    never prune. Closed items also can't be flipped, so they're dead weight.
+
+    We keep CLOSED_ITEM_RETENTION_DAYS of closed items as a buffer (so you
+    can still look up "what did that lot finally close at" the morning
+    after). Items with no parseable closing time are kept by default —
+    we don't have evidence they're stale.
+
+    Returns the number of items removed.
+    """
+    keep_days = config.CLOSED_ITEM_RETENTION_DAYS
+    if keep_days < 0:
+        return 0  # negative = no purging
+    cutoff = datetime.now(timezone.utc) - timedelta(days=keep_days)
+
+    to_drop = []
+    for key, it in items.items():
+        if not it.closing_time_iso:
+            continue  # no close time → keep, can't judge
+        try:
+            close = datetime.fromisoformat(it.closing_time_iso.replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            continue  # unparseable → keep
+        if close < cutoff:
+            to_drop.append(key)
+
+    for key in to_drop:
+        del items[key]
+    return len(to_drop)
+
+
 def do_enrich(items: dict[str, Item], limit: int | None = None) -> dict[str, Item]:
     """Call Gemini in batches for items that don't yet have an AI estimate.
 
     Skips items whose auction has already closed — there's no point spending
     quota on lots we can't bid on anymore.
 
+    When config.GEMINI_API_KEY_2 is set (and from a different Google Cloud
+    project), this dispatches batches concurrently across both keys via
+    Enricher.enrich_batches_concurrent — roughly doubling throughput.
+    Single-key mode falls back to sequential dispatch automatically.
+
     If `limit` is not None, only enrich up to that many of the pending items
-    (used by --test mode to cap quota burn). The cap applies to the pending
-    list, so an --enrich --test run against an empty test cache is a no-op.
+    (used by --test mode to cap quota burn).
     """
     from enricher import Enricher, chunked, QuotaExhausted  # lazy import
+    import threading as _threading
 
     pending: list[Item] = [
         it for it in items.values()
@@ -313,14 +421,21 @@ def do_enrich(items: dict[str, Item], limit: int | None = None) -> dict[str, Ite
     batches = list(chunked(pending, config.BATCH_SIZE))
     print(f"sending {len(batches)} batches of up to {config.BATCH_SIZE} items "
           f"to {config.GEMINI_MODEL}")
-    print(f"(pacing: {config.GEMINI_DELAY_SECONDS}s between calls)\n")
+    if enricher.worker_count > 1:
+        print(f"(concurrent: {enricher.worker_count} keys × "
+              f"{config.GEMINI_DELAY_SECONDS}s per-key throttle)\n")
+    else:
+        print(f"(pacing: {config.GEMINI_DELAY_SECONDS}s between calls)\n")
 
     now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
     quota_hit = False
 
-    for i, batch in enumerate(batches, 1):
-        print(f"batch {i}/{len(batches)} ({len(batch)} items)...", flush=True)
-        payload = [
+    # ── Build batch payloads upfront so the concurrent dispatcher gets
+    # ── plain dicts and doesn't have to know about the Item class.
+    # ── We keep the batches list of Items in parallel for result mapping.
+    payloads: list[list[dict]] = []
+    for batch in batches:
+        payloads.append([
             {
                 "item_id": it.key(),
                 "title": it.title,
@@ -330,23 +445,19 @@ def do_enrich(items: dict[str, Item], limit: int | None = None) -> dict[str, Ite
                 "current_bid_value": it.current_bid_value,
             }
             for it in batch
-        ]
+        ])
 
-        try:
-            valuations = enricher.enrich_batch(payload)
-        except QuotaExhausted as e:
-            print(f"\n⛔ {e}")
-            quota_hit = True
-            break
+    # save_raw is called from multiple threads (after each completed batch).
+    # Serialize so the JSON dump never sees a half-mutated dict.
+    save_lock = _threading.Lock()
 
+    def _apply_valuations(batch_items: list[Item],
+                          valuations: list) -> None:
+        """Write Gemini results back onto the Item objects, then save."""
         if not valuations:
-            print(f"  no valuations returned, skipping batch")
-            save_raw(items)  # checkpoint anyway
-            continue
-
-        # match valuations back to items by item_id
+            return
         by_id = {v.item_id: v for v in valuations}
-        for it in batch:
+        for it in batch_items:
             v = by_id.get(it.key())
             if not v:
                 continue
@@ -358,13 +469,14 @@ def do_enrich(items: dict[str, Item], limit: int | None = None) -> dict[str, Ite
             it.ai_sales_velocity = v.sales_velocity
 
             # ── Deterministic override for unsellable items ──
-            # Force resale to $0 ONLY when the model says "damaged_hard_fix"
-            # — that tier covers both "broken and impossible to fix
-            # affordably" and "fundamentally unsellable" (used hygiene,
-            # expired food, etc). Items with cheap-and-easy fixes
-            # (damaged_easy_fix) are NOT zeroed out — they get a small
-            # haircut at scoring time instead, which preserves the
-            # missing-power-cable projector case.
+            # Force resale to $0 ONLY when the model says
+            # "damaged_hard_fix" — that tier covers both
+            # "broken and impossible to fix affordably" AND
+            # "fundamentally unsellable" (used hygiene, expired food,
+            # etc). Items with cheap-and-easy fixes
+            # (damaged_easy_fix) are NOT zeroed out — they get a
+            # small haircut at scoring time instead, which preserves
+            # the missing-power-cable projector case.
             if v.condition == "damaged_hard_fix":
                 estimated_resale = 0.0
                 it.value_overridden = "yes"
@@ -374,13 +486,30 @@ def do_enrich(items: dict[str, Item], limit: int | None = None) -> dict[str, Ite
             it.ai_estimated_resale = f"{estimated_resale:.2f}"
             it.ai_notes = f"[{v.product_identified}] {v.notes}".strip()
             it.enriched_at = now_iso
-            # compute flip_score (ROI) and gross_profit ($)
             it.flip_score = compute_flip_score(it)
             it.gross_profit = compute_gross_profit(it)
 
-        # checkpoint after each batch
-        save_raw(items)
-        print(f"  ✓ batch {i} done, {len(valuations)} valuations")
+    completed = 0
+    try:
+        for idx, valuations in enricher.enrich_batches_concurrent(payloads):
+            completed += 1
+            batch_items = batches[idx]
+            if not valuations:
+                print(f"  batch {idx + 1}/{len(batches)}: no valuations "
+                      f"returned (skipped)")
+            else:
+                _apply_valuations(batch_items, valuations)
+                print(f"  ✓ batch {idx + 1}/{len(batches)} done, "
+                      f"{len(valuations)} valuations "
+                      f"[{completed}/{len(batches)} complete]")
+            # Checkpoint every batch under the save lock. The full JSON
+            # dump is the cost; with 5-15 MB files post-purge that's
+            # cheap enough to do every batch.
+            with save_lock:
+                save_raw(items)
+    except QuotaExhausted as e:
+        print(f"\n⛔ {e}")
+        quota_hit = True
 
     if quota_hit:
         remaining = sum(1 for it in items.values() if not it.ai_confidence)
@@ -501,13 +630,20 @@ def compute_gross_profit(it: Item) -> str:
 
 
 def recompute_all_flip_scores(items: dict[str, Item]) -> None:
-    """Recompute flip_score AND gross_profit for every item — useful when
-    bids changed but AI data didn't.
+    """Recompute flip_score AND gross_profit for OPEN items only.
+
+    Bids on closed items can't change anymore — their final close price is
+    immutable — so re-scoring them on every cron run just burns CPU and
+    flips no rankings. With 70k items the difference is small but real
+    (a few seconds of pure Python loop on every run × 12 runs/day).
     """
     for it in items.values():
-        if it.ai_confidence and it.ai_confidence != "unknown":
-            it.flip_score = compute_flip_score(it)
-            it.gross_profit = compute_gross_profit(it)
+        if not it.ai_confidence or it.ai_confidence == "unknown":
+            continue
+        if _is_closed(it):
+            continue
+        it.flip_score = compute_flip_score(it)
+        it.gross_profit = compute_gross_profit(it)
 
 
 # ────────────────────────────── main ────────────────────────────────────────
@@ -540,6 +676,18 @@ def main():
 
     items = load_existing()
     print(f"loaded {len(items)} existing items from {RAW_PATH.name}")
+
+    # Purge old closed items BEFORE scraping. This keeps the working set
+    # small, makes the in-memory dict cheap, and most importantly keeps
+    # raw_items.json / web/data/items.json under GitHub's 100 MB hard cap.
+    # Test mode skips the purge so we don't nuke the prod cache by accident
+    # (test mode reads separate files anyway, but belt-and-suspenders).
+    if not test_mode:
+        removed = purge_stale_items(items)
+        if removed:
+            print(f"purged {removed} stale closed items "
+                  f"(>{config.CLOSED_ITEM_RETENTION_DAYS}d past close); "
+                  f"{len(items)} remain")
 
     if not only_enrich:
         items = do_scrape(items, limit=limit)
