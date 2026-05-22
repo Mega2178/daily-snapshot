@@ -17,14 +17,17 @@
   const STATE_KEY = "daily-snapshot:ui-state";
   const STATE_VERSION = 3;               // bump if state schema changes
 
-  // ─── Smart-score weights (request #5) ───────────────────────────
+  // ─── Smart-score weights ────────────────────────────────────────
   // Smart score = w_roi*ROI_norm + w_profit*profit_norm + w_velocity*velocity_norm
-  // Tweak weights here if you want a different emphasis. Defaults bias toward
-  // ROI but give profit a real say — a high-ROI $5 item often loses to a
-  // moderate-ROI $200 item.
+  // Tweak weights here if you want a different emphasis.
+  //
+  // Tuned toward absolute profit dollars (45%) over ROI (30%): a $300
+  // gross-profit item that's 5× ROI is more useful than a $20-profit
+  // item that's 50× ROI, because real-world flip economics care about
+  // dollars per pickup-trip, not ratios.
   const SMART_WEIGHTS = {
-    roi: 0.40,
-    profit: 0.35,
+    roi: 0.30,
+    profit: 0.45,
     velocity: 0.25,
   };
   // Log-scale normalization: we DO NOT cap ROI or profit. Capping would shove
