@@ -57,6 +57,11 @@ class Item:
     additional_detail: str = ""
     title_retail_claim: str = ""  # the "Retail: $X" the seller put in the title
     location: str = ""  # "City, ST" — pulled from the auction-list page panel
+    # True once we've fetched the per-item detail page and pulled its richer
+    # description / condition note. Set by enrich_with_detail_page(). Cached
+    # so we don't re-fetch on every scrape — detail-page content doesn't
+    # change once a lot is listed.
+    description_enriched: bool = False
     # AI enrichment fields (filled later)
     ai_retail_estimate: str = ""
     ai_resale_pct: str = ""
@@ -643,6 +648,192 @@ def crawl_auction_house(
             if location:
                 it.location = location
             yield it
+
+
+def fetch_item_detail(session: Session, item: Item) -> bool:
+    """Fetch the per-item detail page and populate description/additional_detail.
+
+    The auction-list cards only carry the title + image; the real
+    "Description:" and "Additional Detail:" text (which is where
+    condition notes like "torn box", "missing power cable",
+    "untested as-is", "Appears New", "Open Box Powers On" actually
+    live) only appears on the per-item page at
+    /auction/{auction_id}/item/{lot_id}.
+
+    On Equip-Bid item-detail pages, the relevant DOM block is:
+
+        <div class="lot-detail-description description-wrap-fix">
+            <strong>Lot Description:</strong>
+            <br><b>Description: </b>...the real description...
+            <br><b>Additional Detail: </b>...condition note like
+                                             "Appears New" or
+                                             "Open Box Powers On"...
+        </div>
+
+    We also grab <span id="lot_scheduled_close"> when present — it
+    carries a fully-qualified close time like "Fri, May 22, 2026
+    6:27pm CDT" with no relative-day ambiguity. We use it to set
+    closing_time_iso unconditionally so the cache can't drift.
+
+    Returns True if anything got populated, False otherwise. Sets
+    item.description_enriched in either case so we don't retry.
+    Network failures are swallowed (returns False); the rest of the
+    pipeline keeps moving with title-only data.
+    """
+    if not item.item_url or item.description_enriched:
+        return False
+
+    # Resolve relative URLs against BASE_URL
+    url = urljoin(BASE_URL, item.item_url)
+
+    try:
+        html = session.get(url)
+    except Exception as e:
+        print(f"    ! detail page {url} failed: {e}")
+        # Mark enriched=True anyway so we don't retry next run — better
+        # to have title-only data than to re-burn requests indefinitely.
+        # If you want to retry transient failures, set this to False.
+        item.description_enriched = True
+        return False
+
+    soup = BeautifulSoup(html, "html.parser")
+    changed = False
+
+    # ── Description + Additional Detail ──────────────────────────────
+    # The page wraps these in <b>Description: </b> / <b>Additional Detail: </b>
+    # tags inside .lot-detail-description. Pull the surrounding text.
+    desc_block = soup.select_one("div.lot-detail-description")
+    if desc_block:
+        # Walk through the inner content. The structure is:
+        #   <b>Description: </b>{description text}<br>
+        #   <b>Additional Detail: </b>{condition note}
+        # Both labels can be missing on some lots.
+        block_text = desc_block.get_text("\n", strip=True)
+        # Strip the "Lot Description:" header if present
+        block_text = re.sub(r"^Lot Description:\s*\n?", "", block_text)
+
+        dm = re.search(
+            r"Description:\s*(.+?)(?=\n?Additional Detail:|\Z)",
+            block_text,
+            re.S | re.I,
+        )
+        if dm:
+            new_desc = re.sub(r"\s+", " ", dm.group(1)).strip()
+            # Only overwrite if it's longer / more informative than what
+            # we already have. The list-page image-title is a decent
+            # fallback; some detail pages just repeat the title.
+            if new_desc and len(new_desc) > len(item.description):
+                item.description = new_desc
+                changed = True
+
+        am = re.search(
+            r"Additional Detail:\s*(.+?)\Z",
+            block_text,
+            re.S | re.I,
+        )
+        if am:
+            new_detail = re.sub(r"\s+", " ", am.group(1)).strip()
+            if new_detail:
+                item.additional_detail = new_detail
+                changed = True
+
+    # ── Absolute closing time ─────────────────────────────────────────
+    # Trust the detail-page absolute timestamp over the list-page
+    # relative "Today/Tomorrow" form. Format example:
+    #     "Fri, May 22, 2026 6:27pm CDT"
+    sched = soup.select_one("span#lot_scheduled_close")
+    if sched:
+        sched_text = sched.get_text(" ", strip=True)
+        iso = _parse_absolute_close(sched_text)
+        if iso:
+            item.closing_time_iso = iso
+            # Keep a human-friendly raw too for debugging
+            if sched_text and not item.closing_time_raw:
+                item.closing_time_raw = sched_text
+            changed = True
+
+    item.description_enriched = True
+    return changed
+
+
+# "Fri, May 22, 2026 6:27pm CDT" → ISO UTC.
+# Detail pages give us this fully-qualified form; no day-name relative parsing
+# needed. Falls back to _parse_closing_time on anything not matching the shape.
+_ABS_CLOSE_RE = re.compile(
+    r"(\d{1,2}/\d{1,2}/\d{4})\s+(\d{1,2}):(\d{2})\s*(am|pm)",
+    re.IGNORECASE,
+)
+_ABS_CLOSE_WORDS_RE = re.compile(
+    r"([A-Z][a-z]+),?\s+([A-Z][a-z]+)\s+(\d{1,2}),?\s+(\d{4})\s+"
+    r"(\d{1,2}):?(\d{2})?\s*(am|pm)",
+    re.IGNORECASE,
+)
+_MONTH_NAMES = {m: i for i, m in enumerate(
+    ["january", "february", "march", "april", "may", "june",
+     "july", "august", "september", "october", "november", "december"], 1)}
+# Add 3-letter abbreviations: jan, feb, mar, ...
+_MONTH_NAMES.update({m[:3]: i for m, i in list(_MONTH_NAMES.items())})
+
+
+def _parse_absolute_close(text: str) -> str:
+    """Parse a fully-qualified absolute close time to ISO UTC.
+
+    Accepts both:
+        '05/22/2026 06:27 pm'
+        'Fri, May 22, 2026 6:27pm CDT'
+
+    Returns '' if it can't extract one. Equip-Bid times are Central
+    (CST/CDT); we anchor to America/Chicago and convert to UTC.
+    """
+    if not text:
+        return ""
+    # Form 1: numeric date
+    m = _ABS_CLOSE_RE.search(text)
+    if m:
+        try:
+            d = datetime.strptime(m.group(1), "%m/%d/%Y")
+            hour = int(m.group(2))
+            minute = int(m.group(3))
+            ampm = m.group(4).lower()
+            if ampm == "pm" and hour != 12:
+                hour += 12
+            elif ampm == "am" and hour == 12:
+                hour = 0
+            if _CENTRAL_TZ is not None:
+                local = datetime(d.year, d.month, d.day, hour, minute,
+                                 tzinfo=_CENTRAL_TZ)
+            else:
+                local = datetime(d.year, d.month, d.day, hour, minute,
+                                 tzinfo=timezone(timedelta(hours=-5)))
+            return local.astimezone(timezone.utc).isoformat(timespec="seconds")
+        except (ValueError, TypeError):
+            pass
+    # Form 2: word date ('Fri, May 22, 2026 6:27pm CDT')
+    m = _ABS_CLOSE_WORDS_RE.search(text)
+    if m:
+        try:
+            month = _MONTH_NAMES.get(m.group(2).lower())
+            if not month:
+                return ""
+            day = int(m.group(3))
+            year = int(m.group(4))
+            hour = int(m.group(5))
+            minute = int(m.group(6) or 0)
+            ampm = m.group(7).lower()
+            if ampm == "pm" and hour != 12:
+                hour += 12
+            elif ampm == "am" and hour == 12:
+                hour = 0
+            if _CENTRAL_TZ is not None:
+                local = datetime(year, month, day, hour, minute,
+                                 tzinfo=_CENTRAL_TZ)
+            else:
+                local = datetime(year, month, day, hour, minute,
+                                 tzinfo=timezone(timedelta(hours=-5)))
+            return local.astimezone(timezone.utc).isoformat(timespec="seconds")
+        except (ValueError, TypeError):
+            pass
+    return ""
 
 
 def crawl_all(session: Session | None = None) -> Iterator[Item]:
