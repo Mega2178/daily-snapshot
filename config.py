@@ -11,12 +11,24 @@ from datetime import datetime
 # Get a free key from https://aistudio.google.com/apikey
 # (login with your Google account, "Create API key", copy/paste)
 #
-# The key is read from the GEMINI_API_KEY environment variable, NOT hardcoded
-# here. Two ways it gets set:
-#   - Locally: put it in a .env file next to this one (gitignored).
-#              python-dotenv loads it automatically below.
-#   - In CI:   the GitHub Actions workflow injects it from repo Secrets.
-# Either way, this file is safe to commit because the real key never lives in it.
+# Keys are read from env vars, NOT hardcoded here.
+#   - Locally: put them in a .env file next to this one (gitignored).
+#     python-dotenv loads it automatically below.
+#   - In CI:   the GitHub Actions workflow injects them from repo Secrets.
+#
+# FALLBACK KEY: GEMINI_API_KEY_2 is optional. If set, the enricher will
+# dispatch batches concurrently across both keys, roughly DOUBLING
+# throughput.
+#
+# CRITICAL: the two keys must come from DIFFERENT Google Cloud projects
+# (i.e. different Google accounts, or at minimum a second project under
+# the same account with its own quota allocation). Google enforces
+# rate-limit quotas at the project level, not the key level — two keys
+# inside the same project share one 500 RPD / 15 RPM bucket and the
+# fallback gains you nothing. Two keys in separate projects = 1000 RPD
+# combined and 30 RPM combined.
+#
+# Leave GEMINI_API_KEY_2 unset (empty) to operate single-key.
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -24,6 +36,7 @@ except ImportError:
     pass  # dotenv only needed locally; in CI the env var comes from Actions
 import os
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_API_KEY_2 = os.getenv("GEMINI_API_KEY_2", "")  # optional fallback
 
 
 # ─── SEARCH FILTERS ──────────────────────────────────────────────────────────
@@ -46,21 +59,46 @@ AFFILIATE = 0
 # Seconds between HTTP requests to Equip-Bid. Be polite.
 SCRAPE_DELAY_SECONDS = 1.0
 
+# Fetch the per-item detail page for newly-discovered lots, so the AI can
+# read the real "Description:" and "Additional Detail:" fields (which include
+# the actual condition notes — torn box, missing remote, won't power on, etc.).
+# Without this, the AI defaults virtually every item to "open_box" because the
+# auction-list cards don't carry that text. Trade-off: ~1 extra HTTP request
+# per *new* lot. Already-cached items aren't re-fetched.
+SCRAPE_ITEM_DETAIL_PAGES = True
+
+# Max seconds to spend fetching detail pages in one run. Once exceeded, the
+# scraper stops detail-page fetches and lets the rest enrich on title-only
+# data. Prevents a 12,000-new-item day from blowing past the GitHub Actions
+# timeout. The leftover lots will be detail-fetched on a subsequent run
+# because they're cached without a detail flag.
+#
+# Math at default settings (SCRAPE_DELAY_SECONDS=1.0, single-threaded):
+#   1800s budget = up to ~1,800 detail pages
+#   5400s budget = up to ~5,400 detail pages (covers a busy 5k-item day
+#                                              with margin, fits comfortably
+#                                              in the 4hr workflow timeout)
+# If you drop SCRAPE_DELAY_SECONDS to 0.5, double those numbers.
+SCRAPE_DETAIL_PAGE_TIME_BUDGET_SECONDS = 5400  # 90 min
+
 # Items per Gemini batch call. 25-30 is a sweet spot — bigger = fewer requests
 # but more tokens per call. If you see truncated responses, lower this.
 BATCH_SIZE = 25
 
 # Which Gemini model to use for enrichment.
 # Check your actual quotas at https://ai.dev/rate-limit (they vary by account!).
-# Common defaults as of May 2026:
-#   gemini-3.1-flash-lite-preview  → 500 RPD, 15 RPM, fast and cheap (RECOMMENDED)
-#   gemini-3-flash-preview         → 20 RPD, 5 RPM, smarter but tiny daily quota
-#   gemini-2.5-flash-lite          → 20 RPD on most accounts (deprecated soon)
-#   gemini-2.5-flash               → 20 RPD on most accounts
+# Current free-tier defaults observed in production (May 2026):
+#   gemini-3.1-flash-lite-preview  → 500 RPD, 15 RPM (RECOMMENDED)
+#   gemini-3-flash-preview         → smaller daily quota, smarter
+#   gemini-2.5-flash-lite          → 1000 RPD on some accounts
+#   gemini-2.5-flash               → 250 RPD on most accounts
 GEMINI_MODEL = "gemini-3.1-flash-lite-preview"
 
-# Sleep between Gemini calls (seconds) to stay under RPM limit.
-# 4.5s = safely under 15 RPM. 6s = safely under 10 RPM.
+# Sleep between Gemini calls (seconds) PER KEY to stay under RPM limit.
+# 4.5s = ~13 RPM, safely under the 15 RPM Flash-Lite ceiling.
+# 5s gives a little extra safety margin for clock drift / network jitter.
+# This applies to each worker independently — with two keys, the actual
+# request rate is 2× this (still well-spaced per Google's per-key books).
 GEMINI_DELAY_SECONDS = 4.5
 
 # How many times to retry a single batch when Gemini returns 429/503.
@@ -68,13 +106,27 @@ GEMINI_DELAY_SECONDS = 4.5
 GEMINI_MAX_RETRIES = 3
 
 # If the server says "retry in N seconds" and N is bigger than this, we treat
-# it as a daily-quota wall and stop the run (your already-enriched items are
-# saved; pick up tomorrow with `python scrape.py --enrich`). 90s is a good
-# threshold — short backoffs are normal, longer means you're out for the day.
+# it as a daily-quota wall and either swap to the fallback key or stop.
 GEMINI_GIVEUP_AFTER_SECONDS = 90
 
 # Pickup hassle fudge factor (dollars subtracted when computing flip score)
 PICKUP_HASSLE_DOLLARS = 5.0
+
+
+# ─── DATA RETENTION ──────────────────────────────────────────────────────────
+# How many days AFTER an auction closes to keep its items in raw_items.json.
+# 0 = purge on the next run after the auction closes.
+# 2 = keep for two days after close (good buffer for "what did this finally
+#     sell for" curiosity and lets you re-score / re-enrich any item with bugs).
+# Setting this too high explodes the repo size — GitHub's hard limit is 100 MB
+# per file and at ~3,000 items/day the JSON output passes 100 MB in ~3-4 weeks
+# of accumulation.
+CLOSED_ITEM_RETENTION_DAYS = 2
+
+# Pretty-print web/data/items.json? False = single-line JSON (~30% smaller).
+# Set True for human-readable file in git diffs at the cost of size.
+PRETTY_PRINT_JSON = False
+
 
 # ─── PURCHASE PRICE MODEL ────────────────────────────────────────────────────
 # The auction-site "next required bid" is NOT the actual cost to acquire an
