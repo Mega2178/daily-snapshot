@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time
 from typing import Iterable
 
@@ -206,93 +207,276 @@ fields are what get used by downstream code."""
 
 # ────────────────────────────── enricher ────────────────────────────────────
 
+class _Worker:
+    """One API key + its own client + its own throttle clock.
+
+    Each key has independent per-minute and per-day quotas (when the keys
+    belong to different Google Cloud projects), so each worker tracks its
+    own last_call time and own exhausted flag. Multiple workers can run
+    concurrently; they share nothing but the model name.
+    """
+    def __init__(self, api_key: str, name: str):
+        self.api_key = api_key
+        self.name = name
+        self.client = genai.Client(api_key=api_key)
+        self.model = config.GEMINI_MODEL
+        self.last_call = 0.0
+        self._lock = threading.Lock()  # serializes the per-key throttle clock
+        self.exhausted = False
+
+    def _throttle(self):
+        # Called inside the lock — at most one in-flight call per key.
+        elapsed = time.time() - self.last_call
+        if elapsed < config.GEMINI_DELAY_SECONDS:
+            time.sleep(config.GEMINI_DELAY_SECONDS - elapsed)
+
+    def enrich_batch(self, batch: list[dict]) -> list[ItemValuation]:
+        """Send one batch through this key. Honors per-key rate limit.
+
+        Returns [] on transient failure, raises QuotaExhausted on daily wall.
+        The lock guarantees that the per-minute throttle is respected even
+        when multiple threads share this worker (they shouldn't in our
+        current design — one worker per thread — but it's cheap insurance).
+        """
+        if not batch:
+            return []
+        if self.exhausted:
+            raise QuotaExhausted(f"{self.name} already marked exhausted")
+
+        prompt = _build_prompt(batch)
+
+        for attempt in range(config.GEMINI_MAX_RETRIES + 1):
+            with self._lock:
+                self._throttle()
+                try:
+                    response = self.client.models.generate_content(
+                        model=self.model,
+                        contents=prompt,
+                        config=genai_types.GenerateContentConfig(
+                            system_instruction=SYSTEM_PROMPT,
+                            response_mime_type="application/json",
+                            response_schema=BatchResponse,
+                            temperature=0.2,
+                        ),
+                    )
+                    self.last_call = time.time()
+                    return _parse_response(response)
+                except Exception as e:
+                    self.last_call = time.time()
+                    err_str = str(e)
+                    code = _extract_status_code(err_str)
+                    retry_delay = _extract_retry_delay(err_str)
+
+            # ── handle errors OUTSIDE the lock so the other worker
+            # ── isn't blocked while we sleep during retry backoff
+            if code == 429:
+                if retry_delay is None:
+                    retry_delay = 30
+                if retry_delay > config.GEMINI_GIVEUP_AFTER_SECONDS:
+                    # Daily wall on this key. Mark it dead.
+                    self.exhausted = True
+                    raise QuotaExhausted(
+                        f"{self.name}: daily quota wall "
+                        f"(retry in {retry_delay}s)"
+                    ) from e
+                if attempt < config.GEMINI_MAX_RETRIES:
+                    wait = retry_delay + 1
+                    print(f"  [{self.name}][429] throttle, waiting {wait}s "
+                          f"(attempt {attempt + 1}/{config.GEMINI_MAX_RETRIES})")
+                    time.sleep(wait)
+                    continue
+                print(f"  [{self.name}][429] giving up on batch after "
+                      f"{config.GEMINI_MAX_RETRIES} retries")
+                return []
+
+            if code == 503:
+                if attempt < config.GEMINI_MAX_RETRIES:
+                    wait = (attempt + 1) * 5
+                    print(f"  [{self.name}][503] overloaded, retry in {wait}s "
+                          f"(attempt {attempt + 1}/{config.GEMINI_MAX_RETRIES})")
+                    time.sleep(wait)
+                    continue
+                print(f"  [{self.name}][503] giving up on this batch")
+                return []
+
+            # Anything else: log and skip
+            print(f"  ! [{self.name}] Gemini call failed: {err_str[:200]}")
+            return []
+
+        return []
+
+
 class Enricher:
+    """Coordinator over one or two API key workers.
+
+    Usage:
+        e = Enricher()
+        # Single-batch (sequential, used by tests and legacy paths):
+        valuations = e.enrich_batch(batch)
+        # Many batches (concurrent across keys if multiple are configured):
+        for batch_idx, valuations in e.enrich_batches_concurrent(all_batches):
+            ...
+
+    With two keys, batches are dispatched round-robin across worker threads;
+    each thread blocks on its own per-key throttle clock so the two keys run
+    in genuine parallel against Google's API. Throughput scales linearly with
+    the number of keys (modulo Google-side overload).
+
+    Quota walls are handled per worker: when one key gets a long-retry 429,
+    that worker is marked exhausted and the remaining batches reroute to the
+    other worker(s). When ALL workers are exhausted, the iterator stops and
+    the orchestrator persists already-enriched items.
+    """
     def __init__(self):
         if not config.GEMINI_API_KEY or config.GEMINI_API_KEY == "PASTE_YOUR_KEY_HERE":
             raise SystemExit(
                 "GEMINI_API_KEY is not set in config.py.\n"
                 "Get a free key at https://aistudio.google.com/apikey"
             )
-        self.client = genai.Client(api_key=config.GEMINI_API_KEY)
+        # Build the worker list. Each worker = one key + one client.
+        self._workers: list[_Worker] = [
+            _Worker(config.GEMINI_API_KEY, "key1")
+        ]
+        if (config.GEMINI_API_KEY_2
+                and config.GEMINI_API_KEY_2 != config.GEMINI_API_KEY):
+            self._workers.append(_Worker(config.GEMINI_API_KEY_2, "key2"))
         self.model = config.GEMINI_MODEL
-        self.last_call = 0.0
 
-    def _throttle(self):
-        elapsed = time.time() - self.last_call
-        if elapsed < config.GEMINI_DELAY_SECONDS:
-            time.sleep(config.GEMINI_DELAY_SECONDS - elapsed)
+        # Legacy: single-batch callers always use worker[0] unless it's
+        # exhausted, then fall through to whichever remains.
+        if len(self._workers) > 1:
+            print(f"  enricher: {len(self._workers)} API keys → concurrent dispatch")
+
+    @property
+    def worker_count(self) -> int:
+        return len(self._workers)
+
+    def _live_workers(self) -> list[_Worker]:
+        return [w for w in self._workers if not w.exhausted]
 
     def enrich_batch(self, batch: list[dict]) -> list[ItemValuation]:
-        """Send ~25 items in one Gemini call. Retries on 429/503.
+        """Backwards-compatible single-batch sender.
 
-        Raises QuotaExhausted if Google tells us the wait is longer than
-        GEMINI_GIVEUP_AFTER_SECONDS — the daily-quota wall.
+        Tries the first live worker; on QuotaExhausted, rotates. Raises
+        QuotaExhausted only when ALL workers are dead. Used by callers
+        that don't want concurrency (e.g. the --test path).
         """
-        if not batch:
-            return []
-
-        prompt = _build_prompt(batch)
-
-        for attempt in range(config.GEMINI_MAX_RETRIES + 1):
-            self._throttle()
+        last_err = None
+        for w in self._live_workers():
             try:
-                response = self.client.models.generate_content(
-                    model=self.model,
-                    contents=prompt,
-                    config=genai_types.GenerateContentConfig(
-                        system_instruction=SYSTEM_PROMPT,
-                        response_mime_type="application/json",
-                        response_schema=BatchResponse,
-                        temperature=0.2,
-                    ),
+                return w.enrich_batch(batch)
+            except QuotaExhausted as e:
+                print(f"  → {w.name} exhausted, trying next worker")
+                last_err = e
+                continue
+        raise QuotaExhausted(
+            f"all {len(self._workers)} configured key(s) are exhausted. "
+            f"Stopping; already-enriched items are saved. "
+            f"Re-run `python scrape.py --enrich` after midnight Pacific."
+        ) from last_err
+
+    def enrich_batches_concurrent(self, batches: list[list[dict]]):
+        """Dispatch many batches across all live workers concurrently.
+
+        Yields (index, valuations) tuples in COMPLETION order (not input
+        order), so the caller must use the index to map results back to
+        items. Implementation note: we use ThreadPoolExecutor with one
+        worker thread per API key, and submit batches round-robin. Each
+        thread blocks on its own _Worker._lock (the throttle clock), so
+        cross-key parallelism is real.
+
+        If a worker raises QuotaExhausted, its in-flight batch result is
+        ([] failed), and remaining batches reroute to live workers. If ALL
+        workers go exhausted, the iterator stops yielding — remaining
+        batches stay unenriched in the dataset and pick up on the next run.
+        """
+        if not batches:
+            return
+
+        live = self._live_workers()
+        if not live:
+            raise QuotaExhausted("no live API keys to dispatch with")
+
+        # Single-worker path: just iterate. Avoids thread-pool overhead and
+        # makes test runs deterministic.
+        if len(live) == 1:
+            w = live[0]
+            for idx, batch in enumerate(batches):
+                try:
+                    yield idx, w.enrich_batch(batch)
+                except QuotaExhausted:
+                    raise
+            return
+
+        # Multi-worker concurrent dispatch.
+        # We use a simple "submit one batch per worker, await any, submit
+        # next" loop. ThreadPoolExecutor.submit is fine because each worker
+        # already serializes its own calls via its lock.
+        import concurrent.futures as _f
+
+        # Map future -> (batch_idx, worker_assigned). Workers are bound at
+        # submit time; if a worker exhausts mid-run we don't reassign the
+        # already-submitted future, just route future submissions away.
+        pending: dict = {}
+        executor = _f.ThreadPoolExecutor(max_workers=len(self._workers))
+        try:
+            batch_iter = iter(enumerate(batches))
+
+            def _submit_next() -> bool:
+                """Pull the next batch off the iterator and submit it to
+                the worker with the least in-flight work. Returns False
+                when the iterator is empty or no workers remain alive."""
+                try:
+                    idx, batch = next(batch_iter)
+                except StopIteration:
+                    return False
+                live_now = self._live_workers()
+                if not live_now:
+                    return False
+                # Pick the worker with the fewest currently-pending futures.
+                load = {w: 0 for w in live_now}
+                for (_idx, w) in pending.values():
+                    if w in load:
+                        load[w] += 1
+                chosen = min(live_now, key=lambda w: load[w])
+                fut = executor.submit(chosen.enrich_batch, batch)
+                pending[fut] = (idx, chosen)
+                return True
+
+            # Prime: submit up to one batch per worker.
+            for _ in range(len(live)):
+                if not _submit_next():
+                    break
+
+            while pending:
+                done, _ = _f.wait(
+                    pending.keys(), return_when=_f.FIRST_COMPLETED
                 )
-                self.last_call = time.time()
-                return _parse_response(response)
+                for fut in done:
+                    idx, worker = pending.pop(fut)
+                    try:
+                        result = fut.result()
+                    except QuotaExhausted:
+                        # This worker is done. Any remaining batches will
+                        # reroute on the next _submit_next() call.
+                        result = []
+                    except Exception as e:
+                        print(f"  ! [{worker.name}] worker exception: {e}")
+                        result = []
+                    yield idx, result
+                    # Top up: keep up to len(live) in flight.
+                    _submit_next()
+        finally:
+            executor.shutdown(wait=True)
 
-            except Exception as e:
-                self.last_call = time.time()
-                err_str = str(e)
-                code = _extract_status_code(err_str)
-                retry_delay = _extract_retry_delay(err_str)
-
-                # 429 = quota. If the wait is huge, we've hit the daily wall.
-                if code == 429:
-                    if retry_delay is None:
-                        retry_delay = 30  # default if we can't parse
-                    if retry_delay > config.GEMINI_GIVEUP_AFTER_SECONDS:
-                        raise QuotaExhausted(
-                            f"daily quota wall hit (Google asks to wait "
-                            f"{retry_delay}s). Stopping; already-enriched "
-                            f"items are saved. Re-run `python scrape.py "
-                            f"--enrich` after midnight Pacific."
-                        ) from e
-                    if attempt < config.GEMINI_MAX_RETRIES:
-                        wait = retry_delay + 1  # +1 sec safety margin
-                        print(f"  [429] quota throttle, waiting {wait}s "
-                              f"(attempt {attempt + 1}/{config.GEMINI_MAX_RETRIES})")
-                        time.sleep(wait)
-                        continue
-                    else:
-                        print(f"  [429] giving up on this batch after "
-                              f"{config.GEMINI_MAX_RETRIES} retries")
-                        return []
-
-                # 503 = transient overload. Exponential backoff.
-                if code == 503:
-                    if attempt < config.GEMINI_MAX_RETRIES:
-                        wait = (attempt + 1) * 5
-                        print(f"  [503] overloaded, retry in {wait}s "
-                              f"(attempt {attempt + 1}/{config.GEMINI_MAX_RETRIES})")
-                        time.sleep(wait)
-                        continue
-                    print(f"  [503] giving up on this batch")
-                    return []
-
-                # Anything else: log and skip
-                print(f"  ! Gemini call failed: {err_str[:200]}")
-                return []
-
-        return []
+        # If we exited because all workers exhausted but batches remain,
+        # surface that to the caller so it can stop cleanly.
+        if self._live_workers() == [] and any(True for _ in batch_iter):
+            raise QuotaExhausted(
+                f"all {len(self._workers)} configured key(s) exhausted "
+                f"during concurrent dispatch. Already-enriched items "
+                f"are saved. Re-run after midnight Pacific."
+            )
 
 
 def chunked(seq: list, n: int) -> Iterable[list]:
