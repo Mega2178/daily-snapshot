@@ -27,6 +27,12 @@ except Exception:
 
 BASE_URL = "https://www.equip-bid.com"
 
+# How many "sample" scraped items to echo to the log across the ENTIRE run,
+# so you can eyeball that the scraper is pulling real titles/bids and not
+# empty cards. Kept deliberately small so it never floods the GitHub Actions
+# log. Set to 0 to disable sample prints entirely.
+SAMPLE_ITEM_PRINT_LIMIT = 3
+
 DEFAULT_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -609,6 +615,32 @@ def parse_house_locations(list_html: str) -> dict[str, str]:
     return out
 
 
+# Mutable run-scoped counter for how many sample items we've printed so far.
+# Reset at the start of each crawl_all() so re-runs in one process start fresh.
+_sample_items_printed = [0]
+
+
+def _print_sample_item(it: Item) -> None:
+    """Echo one scraped item's key fields to the log, up to the run-wide cap.
+
+    This is a sanity check, not progress tracking — it lets you confirm the
+    scraper is extracting real titles + bids + close times rather than blank
+    cards, without printing all ~2,000 items. Truncates long titles so each
+    sample stays a single tidy line.
+    """
+    if _sample_items_printed[0] >= SAMPLE_ITEM_PRINT_LIMIT:
+        return
+    _sample_items_printed[0] += 1
+    title = (it.title or "(no title)").strip()
+    if len(title) > 70:
+        title = title[:67] + "..."
+    bid = it.current_bid or "$0.00"
+    close = it.closing_time_raw or "(no close time)"
+    n = _sample_items_printed[0]
+    print(f"    · sample {n}/{SAMPLE_ITEM_PRINT_LIMIT}: \"{title}\" "
+          f"| bid {bid} | closes {close}")
+
+
 def crawl_auction_house(
     session: Session, house_url: str, location: str = ""
 ) -> Iterator[Item]:
@@ -632,6 +664,7 @@ def crawl_auction_house(
     for it in items:
         if location:
             it.location = location
+        _print_sample_item(it)
         yield it
 
     for page in range(2, max_page + 1):
@@ -839,6 +872,7 @@ def _parse_absolute_close(text: str) -> str:
 def crawl_all(session: Session | None = None) -> Iterator[Item]:
     """Top-level: visit auction list, walk every house, yield every item."""
     session = session or Session(delay=config.SCRAPE_DELAY_SECONDS)
+    _sample_items_printed[0] = 0  # fresh sample budget each run
 
     list_url = build_auction_list_url()
     print(f"Auction list: {list_url}")
