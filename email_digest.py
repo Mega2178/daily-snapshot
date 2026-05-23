@@ -226,7 +226,7 @@ def _item_card_html(it: dict, rank: int) -> str:
 
     roi = _fmt_roi(it.get("flip_score"))
     profit = _fmt_money(it.get("gross_profit"))
-    bid = escape(it.get("current_bid", "") or it.get("next_required_bid", "") or "\u2014")
+    bid = escape(it.get("next_required_bid", "") or it.get("current_bid", "") or "\u2014")
     resale = _fmt_money(it.get("ai_estimated_resale"), decimals_under=0)
     retail = _fmt_money(it.get("ai_retail_estimate"), decimals_under=0)
     close = escape(_local_close_label(it.get("closing_time_iso", "")))
@@ -292,7 +292,7 @@ def _item_card_html(it: dict, rank: int) -> str:
           <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%"
                  style="border-top:1px solid #e3e0d8;padding-top:10px;">
             <tr>
-              {_stat("Current bid", bid)}
+              {_stat("Next bid", bid)}
               {_stat("Est. resale", resale, "#1f4d3f")}
               {_stat("Retail (new)", retail)}
             </tr>
@@ -356,7 +356,7 @@ def render_text(items: list[dict]) -> str:
         lines.append(f"{i}. {it.get('title','Untitled')}")
         lines.append(f"   ROI {_fmt_roi(it.get('flip_score'))}  |  "
                      f"gross profit {_fmt_money(it.get('gross_profit'))}")
-        lines.append(f"   bid {it.get('current_bid') or it.get('next_required_bid','?')} -> "
+        lines.append(f"   next bid {it.get('next_required_bid') or it.get('current_bid','?')} -> "
                      f"resale {_fmt_money(it.get('ai_estimated_resale'), 0)}")
         if it.get("location"):
             lines.append(f"   {it['location']}")
