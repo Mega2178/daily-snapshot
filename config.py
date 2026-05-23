@@ -181,7 +181,7 @@ EMAIL_MIN_FLIP_SCORE = 6.0
 #       morning; it's a deliberately high bar so only big flips trigger email.
 #       If you want these to surface when bids are realistic, move the email
 #       workflow's cron to the evening. See EMAIL_SETUP.md.
-EMAIL_MIN_PROFIT = 300.0
+EMAIL_MIN_PROFIT = 25.0
 #
 #   EMAIL_MIN_CONDITION = worst condition you'll accept ("at least ___").
 #       Best -> worst: new, open_box, damaged_easy_fix, damaged_hard_fix.
