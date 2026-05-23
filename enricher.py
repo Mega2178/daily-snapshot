@@ -246,6 +246,11 @@ class _Worker:
         prompt = _build_prompt(batch)
 
         for attempt in range(config.GEMINI_MAX_RETRIES + 1):
+            # `caught` survives the except block (Python deletes the `except
+            # ... as e` target when the block exits, so we can't reference it
+            # in the error-classification code below, which runs outside the
+            # lock). We stash the exception here to use with `raise ... from`.
+            caught: Exception | None = None
             with self._lock:
                 self._throttle()
                 try:
@@ -263,6 +268,7 @@ class _Worker:
                     return _parse_response(response)
                 except Exception as e:
                     self.last_call = time.time()
+                    caught = e
                     err_str = str(e)
                     code = _extract_status_code(err_str)
                     retry_delay = _extract_retry_delay(err_str)
@@ -278,7 +284,7 @@ class _Worker:
                     raise QuotaExhausted(
                         f"{self.name}: daily quota wall "
                         f"(retry in {retry_delay}s)"
-                    ) from e
+                    ) from caught
                 if attempt < config.GEMINI_MAX_RETRIES:
                     wait = retry_delay + 1
                     print(f"  [{self.name}][429] throttle, waiting {wait}s "
@@ -298,6 +304,25 @@ class _Worker:
                     continue
                 print(f"  [{self.name}][503] giving up on this batch")
                 return []
+
+            # ── Permanent, non-retryable errors ─────────────────────────
+            # 401 = bad/expired key, 403 = key valid but the Google Cloud
+            # project is suspended / denied access / API not enabled, 400 =
+            # malformed key. Retrying or routing more batches to this key is
+            # pointless — it will fail identically every time. Mark the
+            # worker dead so enrich_batches_concurrent stops dispatching to
+            # it and reroutes everything to the remaining live key(s).
+            # Without this, a single banned key silently eats ~half of all
+            # batches for the entire run (this was the cause of the wall of
+            # "403 PERMISSION_DENIED ... batch N/M: no valuations" spam).
+            if code in (400, 401, 403) or _is_permanent_auth_error(err_str):
+                self.exhausted = True
+                raise QuotaExhausted(
+                    f"{self.name}: permanent error "
+                    f"(HTTP {code if code else '4xx'}) — key/project rejected. "
+                    f"Marking this key dead and routing to other key(s). "
+                    f"Detail: {err_str[:160]}"
+                ) from caught
 
             # Anything else: log and skip
             print(f"  ! [{self.name}] Gemini call failed: {err_str[:200]}")
@@ -414,33 +439,42 @@ class Enricher:
         # already serializes its own calls via its lock.
         import concurrent.futures as _f
 
-        # Map future -> (batch_idx, worker_assigned). Workers are bound at
-        # submit time; if a worker exhausts mid-run we don't reassign the
-        # already-submitted future, just route future submissions away.
+        # Map future -> (batch_idx, batch, worker_assigned). Workers are
+        # bound at submit time; if a worker exhausts mid-run we don't
+        # reassign the already-submitted future — but we DO push its batch
+        # onto `requeue` so a live worker picks it up (no batch is lost just
+        # because it happened to land on the key that died).
         pending: dict = {}
+        requeue: list = []  # [(idx, batch), ...] batches to re-dispatch
         executor = _f.ThreadPoolExecutor(max_workers=len(self._workers))
         try:
             batch_iter = iter(enumerate(batches))
 
             def _submit_next() -> bool:
-                """Pull the next batch off the iterator and submit it to
+                """Submit the next batch (preferring any requeued batch) to
                 the worker with the least in-flight work. Returns False
-                when the iterator is empty or no workers remain alive."""
-                try:
-                    idx, batch = next(batch_iter)
-                except StopIteration:
-                    return False
+                when there's nothing left to submit or no workers remain
+                alive."""
                 live_now = self._live_workers()
                 if not live_now:
                     return False
+                # Drain the requeue first so a batch orphaned by a dead key
+                # gets retried before we pull brand-new work.
+                if requeue:
+                    idx, batch = requeue.pop(0)
+                else:
+                    try:
+                        idx, batch = next(batch_iter)
+                    except StopIteration:
+                        return False
                 # Pick the worker with the fewest currently-pending futures.
                 load = {w: 0 for w in live_now}
-                for (_idx, w) in pending.values():
+                for (_idx, _batch, w) in pending.values():
                     if w in load:
                         load[w] += 1
                 chosen = min(live_now, key=lambda w: load[w])
                 fut = executor.submit(chosen.enrich_batch, batch)
-                pending[fut] = (idx, chosen)
+                pending[fut] = (idx, batch, chosen)
                 return True
 
             # Prime: submit up to one batch per worker.
@@ -453,17 +487,28 @@ class Enricher:
                     pending.keys(), return_when=_f.FIRST_COMPLETED
                 )
                 for fut in done:
-                    idx, worker = pending.pop(fut)
+                    idx, batch, worker = pending.pop(fut)
                     try:
                         result = fut.result()
                     except QuotaExhausted:
-                        # This worker is done. Any remaining batches will
-                        # reroute on the next _submit_next() call.
-                        result = []
+                        # This worker is dead (quota wall or permanent auth
+                        # error). Its batch wasn't processed — push it back so
+                        # a live worker retries it. If no workers remain, the
+                        # post-loop check below surfaces the stop cleanly.
+                        if not getattr(worker, "_death_announced", False):
+                            worker._death_announced = True
+                            live_names = [w.name for w in self._live_workers()]
+                            print(f"  → {worker.name} is dead; rerouting all "
+                                  f"remaining batches to: "
+                                  f"{', '.join(live_names) or '(none left)'}")
+                        if self._live_workers():
+                            requeue.append((idx, batch))
+                        result = None  # don't yield an empty result for it
                     except Exception as e:
                         print(f"  ! [{worker.name}] worker exception: {e}")
                         result = []
-                    yield idx, result
+                    if result is not None:
+                        yield idx, result
                     # Top up: keep up to len(live) in flight.
                     _submit_next()
         finally:
@@ -471,7 +516,8 @@ class Enricher:
 
         # If we exited because all workers exhausted but batches remain,
         # surface that to the caller so it can stop cleanly.
-        if self._live_workers() == [] and any(True for _ in batch_iter):
+        leftover = bool(requeue) or any(True for _ in batch_iter)
+        if self._live_workers() == [] and leftover:
             raise QuotaExhausted(
                 f"all {len(self._workers)} configured key(s) exhausted "
                 f"during concurrent dispatch. Already-enriched items "
@@ -526,6 +572,35 @@ def _parse_response(response) -> list[ItemValuation]:
 _STATUS_RE = re.compile(r"\b(\d{3})\s+[A-Z_]+", re.MULTILINE)
 _RETRY_DELAY_RE = re.compile(r"['\"]?retryDelay['\"]?\s*:\s*['\"]?(\d+(?:\.\d+)?)\s*s['\"]?")
 _RETRY_PHRASE_RE = re.compile(r"retry in (\d+(?:\.\d+)?)\s*s", re.IGNORECASE)
+
+# Phrases Google returns for permanently-broken keys/projects. These mean
+# "this key will NEVER work again on its own" — as opposed to 429 (wait and
+# retry) or 503 (overloaded, retry soon). Used as a fallback when the numeric
+# status code isn't cleanly parseable from the wrapped SDK error string.
+_PERMANENT_AUTH_PHRASES = (
+    "permission_denied",
+    "denied access",
+    "api key not valid",
+    "api_key_invalid",
+    "unauthenticated",
+    "permission denied",
+    "consumer_suspended",
+    "has been suspended",
+    "is not enabled",
+    "billing",
+)
+
+
+def _is_permanent_auth_error(err_str: str) -> bool:
+    """True if the error text indicates a permanently-dead key/project.
+
+    A 403 PERMISSION_DENIED (suspended project), 401 UNAUTHENTICATED
+    (bad/expired key), or "API not enabled" will fail identically on every
+    future call, so the caller should mark the worker exhausted rather than
+    retrying or routing more batches to it.
+    """
+    low = (err_str or "").lower()
+    return any(p in low for p in _PERMANENT_AUTH_PHRASES)
 
 
 def _extract_status_code(err_str: str) -> int | None:
