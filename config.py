@@ -49,7 +49,7 @@ DISTANCE_ZIP = "64081"
 
 # Distance radius in miles. -1 means "any distance".
 # Common values: -1, 10, 25, 50, 75, 100, 150, 250
-DISTANCE_RADIUS = -1
+DISTANCE_RADIUS = 75
 
 # Affiliate filter (auction-house company). 0 = all affiliates.
 AFFILIATE = 0
