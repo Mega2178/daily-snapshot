@@ -157,3 +157,51 @@ SALES_VELOCITY_SCORES = {
 # default of 50 = exactly 2 Gemini batches, which is the smallest run that
 # still exercises the batch loop, checkpointing, and inter-batch pacing.
 TEST_MODE_ITEM_LIMIT = 50
+
+
+# ─── DAILY EMAIL DIGEST ──────────────────────────────────────────────────────
+# email_digest.py reads web/data/items.json, keeps only OPEN auction lots that
+# clear ALL of the thresholds below, takes the top EMAIL_TOP_N by flip_score,
+# and emails them once a day. If nothing clears the bar, no email is sent.
+#
+# THRESHOLDS — edit these freely. They map 1:1 to "I want items that..."
+#
+#   EMAIL_MIN_FLIP_SCORE = the minimum ROI (flip_score) as a decimal.
+#       flip_score = (effective_resale - cost - hassle) / cost, where
+#       cost = next_required_bid * PURCHASE_PRICE_MULTIPLIER (1.3). This is the
+#       SAME number shown as "ROI" on your dashboard (e.g. "6.00x").
+#       "6x ROI or better" -> 6.0 (matches the flip_score column directly).
+EMAIL_MIN_FLIP_SCORE = 6.0
+#
+#   EMAIL_MIN_PROFIT = minimum absolute gross profit in dollars.
+#       gross_profit = effective_resale - cost - hassle, with cost =
+#       next_required_bid * 1.3 (same basis as ROI above).
+#       IMPORTANT: cost tracks the CURRENT next-bid, which is low early in the
+#       day and climbs toward close. A $300 floor will rarely match in the
+#       morning; it's a deliberately high bar so only big flips trigger email.
+#       If you want these to surface when bids are realistic, move the email
+#       workflow's cron to the evening. See EMAIL_SETUP.md.
+EMAIL_MIN_PROFIT = 300.0
+#
+#   EMAIL_MIN_CONDITION = worst condition you'll accept ("at least ___").
+#       Best -> worst: new, open_box, damaged_easy_fix, damaged_hard_fix.
+#       "at least easy simple fix" -> "damaged_easy_fix" (lets new/open_box through too).
+EMAIL_MIN_CONDITION = "damaged_easy_fix"
+#
+#   EMAIL_MIN_VELOCITY = slowest sales speed you'll accept ("at least ___").
+#       Best -> worst: hot, normal, slow, very_slow, unknown.
+#       "at least normal sales speed" -> "normal" (lets hot through too).
+EMAIL_MIN_VELOCITY = "normal"
+#
+#   EMAIL_TOP_N = how many items to include (the best N by flip_score).
+EMAIL_TOP_N = 5
+
+# Subject line. {n} = item count, {plural} = "" or "s", {date} = "May 23".
+EMAIL_SUBJECT = "Today's top {n} flip{plural} \u2014 {date}"
+
+# SMTP defaults. Override per-run with env vars SMTP_HOST / SMTP_PORT.
+# Gmail: smtp.gmail.com / 587 (STARTTLS) — needs an App Password, see
+# email_digest.py's docstring. Username/password/recipient come from env
+# vars / repo secrets, NEVER hardcoded here.
+EMAIL_SMTP_HOST = "smtp.gmail.com"
+EMAIL_SMTP_PORT = 587
