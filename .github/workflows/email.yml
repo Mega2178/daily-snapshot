@@ -1,0 +1,80 @@
+name: Daily email digest
+
+# Sends the top-N flip digest once a day. Reads web/data/items.json straight
+# from the repo (committed by the every-2-hours "Daily scrape" workflow), so
+# this job does NOT scrape or call Gemini — it's fast and cheap.
+#
+# TIMING: GitHub cron is ALWAYS in UTC and cannot do local time or DST.
+# You're in US Central:
+#     • Summer (CDT, UTC-5): 10:00 AM local = 15:00 UTC   <-- active now
+#     • Winter (CST, UTC-6): 10:00 AM local = 16:00 UTC
+# We schedule BOTH and let the script's own "is it ~10am Central?" guard pick
+# the right one, so you get exactly one email a day year-round without editing
+# this file at the DST switch. (GitHub's scheduler can also lag 5-15 min under
+# load — that's normal and harmless for a daily digest.)
+#
+# Prefer zero fuss? Delete one of the two cron lines and accept that the email
+# arrives at 9am for half the year. The dual-cron + guard below avoids that.
+
+on:
+  schedule:
+    - cron: '0 15 * * *'   # 10:00 AM CDT (summer)
+    - cron: '0 16 * * *'   # 10:00 AM CST (winter)
+  workflow_dispatch:        # lets you send a test email on demand from the Actions tab
+
+permissions:
+  contents: read
+
+concurrency:
+  group: email-digest
+  cancel-in-progress: false
+
+jobs:
+  email:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # email_digest.py uses only the standard library + config.py, so there's
+      # nothing to pip-install. (No requests/bs4/genai needed here.)
+
+      - name: Skip if this run is the wrong half of the DST year
+        id: gate
+        run: |
+          # Only one of the two cron schedules should actually send today.
+          # Compute the current hour in America/Chicago; proceed only when
+          # it's the 10 AM hour locally. Manual (workflow_dispatch) runs always
+          # proceed so you can test any time.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+            echo "Manual run — proceeding."
+            exit 0
+          fi
+          HOUR_LOCAL=$(TZ=America/Chicago date +%H)
+          echo "Local Central hour is $HOUR_LOCAL"
+          if [ "$HOUR_LOCAL" = "10" ]; then
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            echo "Not 10 AM Central right now — this is the other DST cron. Skipping."
+          fi
+
+      - name: Send digest
+        if: steps.gate.outputs.proceed == 'true'
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}      # optional; defaults to smtp.gmail.com
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}      # optional; defaults to 587
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}    # optional; defaults to SMTP_USERNAME
+          PYTHONUNBUFFERED: "1"
+        run: python email_digest.py
