@@ -21,8 +21,26 @@ from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import time
 import config
 from scraper import Item, Session, crawl_all
+
+
+def _fmt_duration(seconds: float) -> str:
+    """Format an elapsed-seconds float as a compact 'Xm YYs' (or 'YYs').
+
+    Used only for the per-phase timing lines so future runs show how long
+    the scrape vs. enrich phases took. Purely cosmetic — no behavior change.
+    """
+    seconds = int(round(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    m, s = divmod(seconds, 60)
+    if m < 60:
+        return f"{m}m {s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h {m:02d}m {s:02d}s"
+
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
 CSV_PATH = SCRIPT_DIR / "items.csv"
@@ -689,13 +707,22 @@ def main():
                   f"(>{config.CLOSED_ITEM_RETENTION_DAYS}d past close); "
                   f"{len(items)} remain")
 
+    scrape_secs = None
+    enrich_secs = None
+
     if not only_enrich:
+        _t0 = time.time()
         items = do_scrape(items, limit=limit)
         save_raw(items)
+        scrape_secs = time.time() - _t0
+        print(f"  scrape phase took {_fmt_duration(scrape_secs)}")
 
     if not only_scrape:
+        _t0 = time.time()
         items = do_enrich(items, limit=limit)
         save_raw(items)
+        enrich_secs = time.time() - _t0
+        print(f"  enrich phase took {_fmt_duration(enrich_secs)}")
 
     # always recompute flip scores at end (bids may have refreshed)
     recompute_all_flip_scores(items)
@@ -712,6 +739,10 @@ def main():
     print(f"total items:    {len(items)}")
     print(f"enriched:       {enriched}")
     print(f"high-conf:      {high_conf}")
+    if scrape_secs is not None:
+        print(f"scrape phase:   {_fmt_duration(scrape_secs)}")
+    if enrich_secs is not None:
+        print(f"enrich phase:   {_fmt_duration(enrich_secs)}")
     print(f"\nwrote {CSV_PATH}")
     print(f"wrote {JSON_PATH}")
     print(f"open it in Excel/PyCharm — top rows are best flips")
