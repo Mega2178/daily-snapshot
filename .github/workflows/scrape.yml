@@ -43,6 +43,7 @@ jobs:
           # both keys (roughly 2× throughput). Add as repo secret
           # named GEMINI_API_KEY_2; leave unset for single-key mode.
           GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
+          PYTHONUNBUFFERED: "1"          # ← add this line
         run: python scrape.py
 
       - name: Commit and push results
