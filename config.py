@@ -171,7 +171,7 @@ TEST_MODE_ITEM_LIMIT = 50
 #       cost = next_required_bid * PURCHASE_PRICE_MULTIPLIER (1.3). This is the
 #       SAME number shown as "ROI" on your dashboard (e.g. "6.00x").
 #       "6x ROI or better" -> 6.0 (matches the flip_score column directly).
-EMAIL_MIN_FLIP_SCORE = 6.0
+EMAIL_MIN_FLIP_SCORE = 1.5
 #
 #   EMAIL_MIN_PROFIT = minimum absolute gross profit in dollars.
 #       gross_profit = effective_resale - cost - hassle, with cost =
@@ -181,7 +181,7 @@ EMAIL_MIN_FLIP_SCORE = 6.0
 #       morning; it's a deliberately high bar so only big flips trigger email.
 #       If you want these to surface when bids are realistic, move the email
 #       workflow's cron to the evening. See EMAIL_SETUP.md.
-EMAIL_MIN_PROFIT = 350.0
+EMAIL_MIN_PROFIT = 100.0
 #
 #   EMAIL_MIN_CONDITION = worst condition you'll accept ("at least ___").
 #       Best -> worst: new, open_box, damaged_easy_fix, damaged_hard_fix.
