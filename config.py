@@ -92,7 +92,7 @@ BATCH_SIZE = 25
 #   gemini-3-flash-preview         → smaller daily quota, smarter
 #   gemini-2.5-flash-lite          → 1000 RPD on some accounts
 #   gemini-2.5-flash               → 250 RPD on most accounts
-GEMINI_MODEL = "gemini-3.1-flash-lite-preview"
+GEMINI_MODEL = "gemini-3.1-flash-lite"
 
 # Sleep between Gemini calls (seconds) PER KEY to stay under RPM limit.
 # 4.5s = ~13 RPM, safely under the 15 RPM Flash-Lite ceiling.
