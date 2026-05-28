@@ -15,7 +15,7 @@
 
   const PAGE_SIZE = 60;                  // cards rendered per "page"
   const STATE_KEY = "daily-snapshot:ui-state";
-  const STATE_VERSION = 3;               // bump if state schema changes
+  const STATE_VERSION = 4;               // bumped: added showClosed
 
   // ─── Smart-score weights ────────────────────────────────────────
   // Smart score = w_roi*ROI_norm + w_profit*profit_norm + w_velocity*velocity_norm
@@ -85,6 +85,7 @@
   const sortSel        = document.getElementById("sort");
   const velocitySel    = document.getElementById("velocity");
   const conditionSel   = document.getElementById("condition");
+  const showClosedInput = document.getElementById("show-closed");
   const minFlipInput   = document.getElementById("min-flip");
   const minFlipValue   = document.getElementById("min-flip-value");
   const searchInput    = document.getElementById("search");
@@ -182,6 +183,9 @@
         const opt = conditionSel.querySelector(`option[value="${pendingRestore.condition}"]`);
         if (opt) conditionSel.value = pendingRestore.condition;
       }
+      if (typeof pendingRestore.showClosed === "boolean") {
+        showClosedInput.checked = pendingRestore.showClosed;
+      }
       if (typeof pendingRestore.minFlip === "number") {
         minFlipInput.value = String(pendingRestore.minFlip);
       }
@@ -195,6 +199,7 @@
     sortSel.addEventListener("change", () => { render(); saveStateSoon(); });
     velocitySel.addEventListener("change", () => { render(); saveStateSoon(); });
     conditionSel.addEventListener("change", () => { render(); saveStateSoon(); });
+    showClosedInput.addEventListener("change", () => { render(); saveStateSoon(); });
     minFlipInput.addEventListener("input", () => {
       minFlipValue.textContent = parseFloat(minFlipInput.value).toFixed(1);
       render();
@@ -241,6 +246,7 @@
         sort: sortSel.value,
         velocity: velocitySel.value,
         condition: conditionSel.value,
+        showClosed: showClosedInput.checked,
         minFlip: parseFloat(minFlipInput.value),
         search: searchInput.value,
         renderedCount: renderedCount,
@@ -457,6 +463,24 @@
     return n;
   }
 
+  // Denominator for the result count, given the current "Show closed" toggle.
+  // When OFF: same as countOpenItems(). When ON: open items + items closed
+  // since local midnight today, so "X of Y" still makes sense (filteredItems
+  // won't ever exceed Y). Uncached on the closed branch — a full walk over a
+  // few thousand items is sub-millisecond, and the toggle is a rare action.
+  function countShownPool(showClosed) {
+    if (!showClosed) return countOpenItems();
+    const cutoff = new Date().setHours(0, 0, 0, 0);
+    let n = 0;
+    for (let i = 0; i < allItems.length; i++) {
+      const it = allItems[i];
+      if (!isClosed(it)) { n++; continue; }
+      const t = closingMs(it);
+      if (!isNaN(t) && t >= cutoff) n++;
+    }
+    return n;
+  }
+
   // Split haystacks: we score title hits higher than body hits so a search
   // for "car" surfaces "Car Stereo" before a dog ramp whose AI notes happen
   // to contain "carpet". Built lazily and cached on the item.
@@ -630,13 +654,21 @@
     const sortBy        = sortSel.value;
     const velocityMode  = velocitySel.value;
     const conditionMode = conditionSel.value;
+    const showClosed    = showClosedInput.checked;
+    const closedCutoff  = new Date().setHours(0, 0, 0, 0);  // local midnight today
     const terms         = buildSearchTerms(searchQueryNorm);
 
     filteredItems = allItems.filter((it) => {
-      // Closed items are NEVER shown — they're not actionable. The "Show
-      // closed" toggle was removed; if a user really wants to see closed
-      // lots they can browse the source site directly.
-      if (isClosed(it)) return false;
+      // Closed items are hidden by default. When "Show today's closed" is on,
+      // include items that closed since local midnight today so the user can
+      // spot big-ROI lots they missed today. Items closed yesterday or earlier
+      // stay hidden either way — they're stale noise. Recomputed every render,
+      // so the cutoff naturally rolls over the moment the clock hits midnight.
+      if (isClosed(it)) {
+        if (!showClosed) return false;
+        const t = closingMs(it);
+        if (isNaN(t) || t < closedCutoff) return false;
+      }
       if (!passesVelocityFilter(it, velocityMode)) return false;
       if (!passesConditionFilter(it, conditionMode)) return false;
       if (!matchesSearch(it, terms)) return false;
@@ -663,13 +695,13 @@
       filteredItems.sort(baseCmp);
     }
 
-    // The total used in the "X of Y items" display is the count of OPEN
-    // items, not the raw allItems length. Closed lots aren't actionable —
-    // showing them in the denominator just inflates the number visually
-    // ("155 of 10,383" → most of those 10,383 are already over).
-    const openTotal = countOpenItems();
+    // The total used in the "X of Y items" display reflects the same pool
+    // the filter pulls from. When Show Closed is off, that's open items
+    // only (same as before). When on, it's open + recently-closed items, so
+    // filteredItems.length never exceeds the denominator.
+    const totalPool = countShownPool(showClosed);
     resultCount.textContent =
-      `${filteredItems.length} of ${openTotal} item${openTotal === 1 ? "" : "s"}`;
+      `${filteredItems.length} of ${totalPool} item${totalPool === 1 ? "" : "s"}`;
 
     // Reset paging and clear the grid
     renderedCount = 0;
@@ -682,6 +714,7 @@
       if (minFlip > 0) reasons.push("lower the min flip score");
       if (velocityMode !== "any") reasons.push("change Velocity to Any");
       if (conditionMode !== "any") reasons.push("change Condition to Any");
+      if (!showClosed) reasons.push("enable Show today's closed");
       const hint = reasons.length
         ? `Try ${reasons.join(" or ")} to see more.`
         : "There are no open items in the data file.";
