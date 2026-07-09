@@ -305,6 +305,29 @@ def parse_max_page(html: str) -> int:
     return max_page
 
 
+_SHOWING_TOTAL_RE = re.compile(
+    r"Showing\s+[\d,]+\s+to\s+[\d,]+\s+of\s+([\d,]+)\s+Auctions?",
+    re.IGNORECASE,
+)
+
+
+def parse_auction_total(html: str) -> int | None:
+    """Parse Z from the list page's 'Showing X to Y of Z Auctions' banner.
+
+    Z is the total number of auctions the site says match the current filter.
+    We compare it against the number of auction houses we actually collected
+    and warn on a shortfall (a silent shortfall = missed auctions + all their
+    lots). Returns None if the banner isn't present.
+    """
+    m = _SHOWING_TOTAL_RE.search(html or "")
+    if not m:
+        return None
+    try:
+        return int(m.group(1).replace(",", ""))
+    except ValueError:
+        return None
+
+
 ITEM_TITLE_ID_RE = re.compile(r"itemTitle(\d+)")
 
 
@@ -892,17 +915,68 @@ def _parse_absolute_close(text: str) -> str:
 
 
 def crawl_all(session: Session | None = None) -> Iterator[Item]:
-    """Top-level: visit auction list, walk every house, yield every item."""
+    """Top-level: visit EVERY page of the auction list, walk every house,
+    yield every item.
+
+    The auction *list* itself paginates (50 auctions/page). It must be paged
+    through exactly like each auction house is, or on a busy day (>50 matching
+    auctions) auction #51+ — and every one of their lots — are silently
+    dropped. Appending &page=N to the filtered list URL preserves the closing
+    filter, so the pages we walk stay scoped to the configured closing date.
+    (Per-auction lot pagination is handled in crawl_auction_house.)
+    """
     session = session or Session(delay=config.SCRAPE_DELAY_SECONDS)
     _sample_items_printed[0] = 0  # fresh sample budget each run
 
     list_url = build_auction_list_url()
     print(f"Auction list: {list_url}")
     list_html = session.get(list_url)
-    houses = parse_auction_houses(list_html)
-    locations = parse_house_locations(list_html)
+
+    max_page = parse_max_page(list_html)
+    total_claimed = parse_auction_total(list_html)
+
+    houses: list[str] = []
+    seen_ids: set[str] = set()
+    locations: dict[str, str] = {}
+
+    def _absorb(html: str) -> None:
+        # Dedupe auction houses by auction ID across pages (a house should
+        # appear on one page only, but never crawl the same one twice).
+        for h in parse_auction_houses(html):
+            m = AUCTION_ID_RE.search(urlparse(h).path)
+            aid = m.group(1) if m else h
+            if aid in seen_ids:
+                continue
+            seen_ids.add(aid)
+            houses.append(h)
+        # Union locations across pages; don't clobber an already-resolved one.
+        for hurl, loc in parse_house_locations(html).items():
+            locations.setdefault(hurl, loc)
+
+    _absorb(list_html)
+    if max_page > 1:
+        claim = total_claimed if total_claimed is not None else "?"
+        print(f"  auction list spans {max_page} pages ({claim} auctions total)")
+    for page in range(2, max_page + 1):
+        sep = "&" if "?" in list_url else "?"
+        page_url = f"{list_url}{sep}page={page}"
+        try:
+            page_html = session.get(page_url)
+        except Exception as e:
+            print(f"  ! auction-list page {page} failed: {e}")
+            continue
+        _absorb(page_html)
+
     resolved = sum(1 for h in houses if h in locations)
     print(f"Found {len(houses)} auction houses ({resolved} with location)")
+
+    # Completeness guard: if the site says Z auctions match but we collected
+    # fewer, warn loudly — a silent shortfall means missing auctions (and all
+    # their lots), which is the owner's #1 concern.
+    if total_claimed is not None and len(houses) < total_claimed:
+        print(f"  ! WARNING: site lists {total_claimed} auctions but only "
+              f"{len(houses)} were collected — {total_claimed - len(houses)} "
+              f"auction(s) may have been missed (list pagination / parse issue)")
 
     for h in houses:
         yield from crawl_auction_house(session, h, location=locations.get(h, ""))
