@@ -8,6 +8,7 @@ Public functions:
 from __future__ import annotations
 
 import re
+import sys
 import time
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timedelta, timezone
@@ -21,9 +22,19 @@ import config
 
 try:
     from zoneinfo import ZoneInfo
-    _CENTRAL_TZ = ZoneInfo("America/Chicago")
-except Exception:
-    _CENTRAL_TZ = None  # graceful fallback for ancient Pythons
+    _CENTRAL_TZ = ZoneInfo(config.APP_TIMEZONE)
+except Exception as _tz_err:
+    # tzdata is pinned in requirements.txt, so this should never trigger. If it
+    # somehow does (missing tz database), close-time parsing drops to a FIXED
+    # UTC-5 offset that mislabels winter CST closes by an hour — warn loudly
+    # rather than silently returning wrong close times.
+    print(
+        f"WARNING: ZoneInfo({config.APP_TIMEZONE!r}) unavailable ({_tz_err}); "
+        f"falling back to a FIXED UTC-5 offset. Winter (CST) close times will "
+        f"be parsed 1 hour early. Install the 'tzdata' package.",
+        file=sys.stderr,
+    )
+    _CENTRAL_TZ = None
 
 BASE_URL = "https://www.equip-bid.com"
 

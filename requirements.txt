@@ -3,3 +3,7 @@ beautifulsoup4
 google-genai
 pydantic
 python-dotenv
+# Provides the IANA timezone database on platforms that lack one (notably
+# Windows). Without it, zoneinfo.ZoneInfo("America/Chicago") raises and the
+# code falls back to a fixed offset that is wrong by an hour every winter.
+tzdata

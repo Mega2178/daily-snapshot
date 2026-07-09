@@ -4,7 +4,46 @@ Configuration. Edit these values, then run scrape.py.
 The only thing you MUST set is GEMINI_API_KEY.
 Everything else has reasonable defaults.
 """
-from datetime import datetime
+import sys
+from datetime import datetime, timedelta, timezone
+
+
+# ─── TIMEZONE ────────────────────────────────────────────────────────────────
+# Equip-Bid is a Kansas City auction site and every closing time it publishes
+# is Central. The owner is in America/Chicago. Define the app timezone ONCE
+# here so every "what day is it / what time is it locally" decision (the
+# closing-date filter, close-time parsing, the email's date) resolves to the
+# same zone regardless of where the process runs.
+#
+# WHY THIS MATTERS: GitHub Actions runners are UTC. A naive datetime.now()
+# there returns the UTC date, which rolls to *tomorrow* at 7 PM Central — so
+# evening cron runs used to query tomorrow's lots and never refresh tonight's
+# still-open ones. Anchoring to Central fixes that.
+APP_TIMEZONE = "America/Chicago"
+
+
+def now_local() -> datetime:
+    """Timezone-aware 'now' in APP_TIMEZONE.
+
+    Requires the IANA tz database. On Linux/macOS it's in the OS; on Windows
+    it comes from the `tzdata` package (pinned in requirements.txt). If it's
+    somehow unavailable we fall back to a FIXED UTC-6 offset and warn loudly —
+    that fallback is wrong by an hour half the year (it ignores CST/CDT), so a
+    silent fallback would be a real bug. The warning tells you to install
+    tzdata; it should never fire in CI or a properly-provisioned venv.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo(APP_TIMEZONE))
+    except Exception as e:  # pragma: no cover - only hit when tzdata is missing
+        print(
+            f"WARNING: could not load timezone {APP_TIMEZONE!r} ({e}); falling "
+            f"back to a FIXED UTC-6 offset. Install the 'tzdata' package "
+            f"(it is in requirements.txt). Dates near midnight and winter (CST) "
+            f"close times may be off by up to an hour until you do.",
+            file=sys.stderr,
+        )
+        return datetime.now(timezone(timedelta(hours=-6)))
 
 
 # ─── REQUIRED ────────────────────────────────────────────────────────────────
@@ -41,7 +80,9 @@ GEMINI_API_KEY_2 = os.getenv("GEMINI_API_KEY_2", "")  # optional fallback
 
 # ─── SEARCH FILTERS ──────────────────────────────────────────────────────────
 # Closing date filter, format: YYYY-MM-DD. Use None to skip the filter.
-CLOSING_DATE = datetime.now().strftime("%Y-%m-%d")
+# Computed in Central (see now_local above), NOT naive/UTC — otherwise CI's
+# UTC runner queries tomorrow's lots from 7 PM Central onward.
+CLOSING_DATE = now_local().strftime("%Y-%m-%d")
 
 
 # ZIP for distance calculation. Equip-Bid wants a ZIP even if you don't filter.

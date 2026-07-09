@@ -311,8 +311,12 @@ def _item_card_html(it: dict, rank: int) -> str:
 
 def render_html(items: list[dict]) -> str:
     """Full HTML email body for the given (already top-N) items."""
-    today = datetime.now().strftime("%A, %B %-d") if sys.platform != "win32" \
-        else datetime.now().strftime("%A, %B %d")
+    # Central, not naive/UTC: the digest header should show the owner's local
+    # day. A naive now() on a UTC runner shows tomorrow once it's past 7 PM
+    # Central (e.g. if the email cron is moved to the evening).
+    _today_local = config.now_local()
+    today = _today_local.strftime("%A, %B %-d") if sys.platform != "win32" \
+        else _today_local.strftime("%A, %B %d")
 
     cond_lbl = _COND.get(config.EMAIL_MIN_CONDITION, (config.EMAIL_MIN_CONDITION,))[0]
     vel_lbl = _VEL.get(config.EMAIL_MIN_VELOCITY, (config.EMAIL_MIN_VELOCITY,))[0]
@@ -441,7 +445,7 @@ def main() -> int:
     subject = config.EMAIL_SUBJECT.format(
         n=n,
         plural="" if n == 1 else "s",
-        date=datetime.now().strftime("%b %d"),
+        date=config.now_local().strftime("%b %d"),  # Central, not naive/UTC
     )
 
     if args.save:
