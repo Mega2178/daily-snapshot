@@ -107,6 +107,11 @@ def select_top_items(items: list[dict]) -> list[dict]:
         conf = (it.get("ai_confidence") or "").strip().lower()
         if conf in ("", "unknown"):
             continue
+        # Per-unit lot whose bid-multiplier couldn't be priced confidently:
+        # never recommend it (its stored flip_score is already blank, but be
+        # explicit so a future scoring change can't leak one into the digest).
+        if (it.get("multiplier_excluded") or "").strip().lower() == "yes":
+            continue
 
         fs = _num(it.get("flip_score"))
         gp = _num(it.get("gross_profit"))

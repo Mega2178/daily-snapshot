@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
 import sys
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
@@ -76,6 +77,8 @@ CSV_FIELDS = [
     "ai_sales_velocity",     # hot / normal / slow / very_slow / unknown
     "ai_condition",          # new / open_box / damaged_easy_fix / damaged_hard_fix
     "value_overridden",      # "yes" if we forced resale to $0 (damaged_hard_fix)
+    "bid_multiplier",        # per-unit multiplier N ("" for single-bid lots)
+    "multiplier_excluded",   # "yes" = per-unit lot excluded from ranking (unpriceable)
     "title",
     "location",              # "City, ST" of the auction house
     "ai_notes",
@@ -504,6 +507,7 @@ def do_enrich(items: dict[str, Item], limit: int | None = None) -> dict[str, Ite
             it.ai_estimated_resale = f"{estimated_resale:.2f}"
             it.ai_notes = f"[{v.product_identified}] {v.notes}".strip()
             it.enriched_at = now_iso
+            _apply_multiplier_fields(it)  # set bid_multiplier / multiplier_excluded first
             it.flip_score = compute_flip_score(it)
             it.gross_profit = compute_gross_profit(it)
 
@@ -537,12 +541,93 @@ def do_enrich(items: dict[str, Item], limit: int | None = None) -> dict[str, Ite
     return items
 
 
+# ──────────────────────── bid-multiplier detection ──────────────────────────
+# Some Equip-Bid lots are priced PER UNIT: the listing text says the winning
+# bid gets multiplied by a quantity, so the real acquisition cost is bid x N,
+# not bid. Scoring them at face value is what ranked money-losers #1 (e.g. an
+# oak-flooring pallet: $1.45 bid shown as +$1,193 profit / 632x ROI, real cost
+# $1.45 x 756 x 1.3 = $1,425 vs $1,200 resale -> a loss, ranked #1).
+#
+# Phrasings below were mined from the real dataset + the audit's examples:
+#   "...Multi Lot of 10, the amount you bid is automatically multiplied by 10,
+#    so 10 x your bid"                              (real; lives in description)
+#   "Bids For This Lot Will Be Multiplied by 756."  (audit example)
+#   "10 Times The Money"                            (auction jargon)
+#
+# We key ONLY on explicit bid-multiplication language. Bare "Lot of N" / "sq
+# ft" / "per unit" are deliberately NOT treated as multipliers: they describe
+# bundle size or coverage on ordinary single-bid lots, and flagging them would
+# wrongly blank out legitimate lots (verified: 0 such false positives across
+# the 8,870-item production dataset).
+_MULT_LANG_RE = re.compile(
+    r"multiplied\s+by|times\s+the\s+money|x\s*your\s*bid|"
+    r"times\s*your\s*bid|x\s*the\s*money",
+    re.IGNORECASE,
+)
+_MULT_NUM_RES = (
+    re.compile(r"multiplied\s+by\s*(\d{1,5})", re.IGNORECASE),
+    re.compile(r"(\d{1,5})\s*(?:x|times)\s*your\s*bid", re.IGNORECASE),
+    re.compile(r"(\d{1,5})\s*(?:x|times)\s*(?:the\s*)?money", re.IGNORECASE),
+)
+# Bundle size ("Multi Lot of N") only CORROBORATES an already-detected
+# multiplier; it never triggers one on its own.
+_MULTI_LOT_RE = re.compile(r"lot\s+of\s*(\d{1,5})", re.IGNORECASE)
+
+
+def _detect_bid_multiplier(it: Item) -> tuple[int, bool]:
+    """Inspect a lot's text (title + description + additional_detail) for
+    per-unit bid-multiplier pricing.
+
+    Returns (multiplier, excluded):
+      * (1, False)   ordinary single-bid lot (no multiplier language).
+      * (N, False)   multiplier language + a single unambiguous N>1 parsed.
+      * (1, True)    multiplier language present but N could NOT be parsed
+                     confidently (missing / conflicting) -> caller must
+                     EXCLUDE the lot from scoring & ranking.
+    """
+    text = " \n ".join(
+        t for t in (it.title, it.description, it.additional_detail) if t
+    )
+    if not _MULT_LANG_RE.search(text):
+        return 1, False
+    candidates = set()
+    for rx in _MULT_NUM_RES:
+        for m in rx.finditer(text):
+            n = int(m.group(1))
+            if n > 1:
+                candidates.add(n)
+    if len(candidates) == 1:
+        return candidates.pop(), False
+    if not candidates:
+        # No explicit number tied to the bid. Fall back to an unambiguous
+        # bundle size ("Lot of N") if there's exactly one; else exclude.
+        lot_ns = {int(m.group(1)) for m in _MULTI_LOT_RE.finditer(text)
+                  if int(m.group(1)) > 1}
+        if len(lot_ns) == 1:
+            return lot_ns.pop(), False
+    return 1, True  # ambiguous / conflicting / unparseable -> exclude
+
+
+def _apply_multiplier_fields(it: Item) -> None:
+    """Persist bid_multiplier / multiplier_excluded on the item.
+
+    Call this immediately before scoring so _purchase_price and
+    compute_flip_score/compute_gross_profit see fresh values, and so the JSON
+    the frontend and email consume carry them too.
+    """
+    mult, excluded = _detect_bid_multiplier(it)
+    it.bid_multiplier = str(mult) if mult > 1 else ""
+    it.multiplier_excluded = "yes" if excluded else ""
+
+
 def _purchase_price(it: Item) -> float | None:
     """The realistic out-of-pocket cost to acquire this item.
 
-    next_required_bid * PURCHASE_PRICE_MULTIPLIER, where the multiplier
-    accounts for buyer's premium, sales tax, and assorted fees on top of
-    the winning bid. Returns None if we can't parse a bid.
+    next_required_bid * bid_multiplier * PURCHASE_PRICE_MULTIPLIER, where
+    PURCHASE_PRICE_MULTIPLIER accounts for buyer's premium, sales tax, and
+    assorted fees, and bid_multiplier (N) is the per-unit quantity for lots
+    priced "bid x N" (1 for ordinary single-bid lots). Returns None if we
+    can't parse a bid.
     """
     next_bid_str = (it.next_required_bid or "").replace("$", "").replace(",", "").strip()
     try:
@@ -554,7 +639,15 @@ def _purchase_price(it: Item) -> float | None:
             return None
     if bid <= 0:
         return None
-    return bid * config.PURCHASE_PRICE_MULTIPLIER
+    # Per-unit lots cost bid x N. bid_multiplier is set by
+    # _apply_multiplier_fields before scoring; "" / unparseable -> 1x.
+    try:
+        mult = int(it.bid_multiplier)
+        if mult < 1:
+            mult = 1
+    except (ValueError, TypeError):
+        mult = 1
+    return bid * config.PURCHASE_PRICE_MULTIPLIER * mult
 
 
 def _condition_resale_factor(it: Item) -> float:
@@ -607,6 +700,10 @@ def compute_flip_score(it: Item) -> str:
     try:
         if it.ai_confidence in ("", "unknown"):
             return ""
+        # Per-unit lot whose multiplier we couldn't price confidently: exclude
+        # from ranking rather than score it at face value (a money-loser at #1).
+        if it.multiplier_excluded == "yes":
+            return ""
         estimated_resale = float(it.ai_estimated_resale or 0)
         if estimated_resale <= 0:
             return ""
@@ -631,6 +728,9 @@ def compute_gross_profit(it: Item) -> str:
     """
     try:
         if it.ai_confidence in ("", "unknown"):
+            return ""
+        # Per-unit lot we couldn't price confidently -> exclude (see flip_score).
+        if it.multiplier_excluded == "yes":
             return ""
         estimated_resale = float(it.ai_estimated_resale or 0)
         if estimated_resale <= 0:
@@ -660,6 +760,7 @@ def recompute_all_flip_scores(items: dict[str, Item]) -> None:
             continue
         if _is_closed(it):
             continue
+        _apply_multiplier_fields(it)  # set bid_multiplier / multiplier_excluded first
         it.flip_score = compute_flip_score(it)
         it.gross_profit = compute_gross_profit(it)
 

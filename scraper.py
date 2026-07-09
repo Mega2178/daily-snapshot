@@ -88,6 +88,17 @@ class Item:
     ai_sales_velocity: str = ""       # hot/normal/slow/very_slow/unknown
     value_overridden: str = ""        # "yes" if we forced resale to $0
     ai_notes: str = ""
+    # ── Bid-multiplier / per-unit lots ──────────────────────────────
+    # Some lots are priced per unit: the listing says e.g. "...the amount you
+    # bid is automatically multiplied by 10, so 10 x your bid" (or "Bids For
+    # This Lot Will Be Multiplied by 756"). The real cost is bid x N, so
+    # scoring them at face value ranks money-losers #1. bid_multiplier holds
+    # the parsed N as a string ("" for ordinary single-bid lots).
+    # multiplier_excluded is "yes" when such language is present but N could
+    # NOT be parsed confidently — those lots stay in the data but are excluded
+    # from scoring/ranking/email so they can never be recommended at 1x cost.
+    bid_multiplier: str = ""
+    multiplier_excluded: str = ""
     flip_score: str = ""  # (estimated_resale - purchase_price - hassle) / purchase_price
     gross_profit: str = ""  # estimated_resale - purchase_price - hassle (in dollars)
     scraped_at: str = ""

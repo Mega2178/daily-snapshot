@@ -347,10 +347,17 @@
     const cb = bidNum(item);
     return isNaN(cb) ? NaN : cb + 1;
   }
-  // Realistic out-of-pocket cost: next required bid * 1.3 (buyer's premium + tax + fees).
+  // Per-unit lots ("...multiplied by N, so N x your bid") really cost bid x N.
+  // bid_multiplier is parsed server-side (scrape.py); "" / absent -> 1x.
+  function bidMultiplierOf(item) {
+    const m = parseInt(item.bid_multiplier, 10);
+    return (!isNaN(m) && m > 1) ? m : 1;
+  }
+  // Realistic out-of-pocket cost: next required bid * 1.3 * bid_multiplier
+  // (buyer's premium + tax + fees, times the per-unit quantity).
   function purchasePriceNum(item) {
     const n = nextBidNum(item);
-    return isNaN(n) ? NaN : n * PURCHASE_PRICE_MULT;
+    return isNaN(n) ? NaN : n * PURCHASE_PRICE_MULT * bidMultiplierOf(item);
   }
 
   // ─── Condition helpers ──────────────────────────────────────────
@@ -366,37 +373,24 @@
     }
     return item._cond;
   }
-  function conditionFactorOf(item) {
-    return CONDITION_FACTORS[conditionOf(item)];
-  }
-
-  // Recompute flip score (ROI) from raw fields. Stays in sync with
-  // compute_flip_score() in scrape.py — same purchase-price model and
-  // same condition-as-resale-multiplier treatment.
-  function computeFlipScore(item) {
-    const resale = num(item.ai_estimated_resale);
-    const purchase = purchasePriceNum(item);
-    if (isNaN(resale) || isNaN(purchase) || resale <= 0) return NaN;
-    const effectiveResale = resale * conditionFactorOf(item);
-    const denom = Math.max(purchase, 1.0);
-    return (effectiveResale - purchase - HASSLE) / denom;
-  }
+  // Flip score (ROI) and gross profit are computed ONCE, server-side, in
+  // scrape.py (compute_flip_score / compute_gross_profit) and stored on each
+  // item. The dashboard DISPLAYS those stored values instead of recomputing
+  // them. This is deliberate:
+  //   • the CSV, the email digest, and this dashboard now show one number
+  //     computed one way — they can't drift apart;
+  //   • the server-side gates come along for free — a blank stored value
+  //     (unknown AI confidence, OR a per-unit lot whose bid-multiplier we
+  //     couldn't price) parses to NaN here and sinks to the bottom of every
+  //     sort, exactly like an unscored item.
+  // (Cost is still computed client-side for the per-card "cost" stat only;
+  //  it is multiplier-aware via purchasePriceNum.)
   function flipScoreOf(item) {
-    if (item._fs === undefined) item._fs = computeFlipScore(item);
+    if (item._fs === undefined) item._fs = num(item.flip_score);
     return item._fs;
   }
-
-  // Gross profit in dollars: effective_resale - purchase - hassle.
-  // Same numerator as flip_score; differs only in normalization.
-  function computeGrossProfit(item) {
-    const resale = num(item.ai_estimated_resale);
-    const purchase = purchasePriceNum(item);
-    if (isNaN(resale) || isNaN(purchase) || resale <= 0) return NaN;
-    const effectiveResale = resale * conditionFactorOf(item);
-    return effectiveResale - purchase - HASSLE;
-  }
   function grossProfitOf(item) {
-    if (item._gp === undefined) item._gp = computeGrossProfit(item);
+    if (item._gp === undefined) item._gp = num(item.gross_profit);
     return item._gp;
   }
 
@@ -790,13 +784,17 @@
     if (isNaN(f)) {
       scoreEl.textContent = "—";
       scoreEl.classList.add("empty");
-      scoreEl.title = "No flip score (AI confidence: unknown)";
+      scoreEl.title = (item.multiplier_excluded === "yes")
+        ? "No flip score — per-unit lot (bid is multiplied); can't price confidently"
+        : "No flip score (AI confidence: unknown)";
     } else {
       scoreEl.textContent = f.toFixed(2) + "×";
+      const multNote = bidMultiplierOf(item) > 1
+        ? ` × ${bidMultiplierOf(item)} (per-unit lot)` : "";
       scoreEl.title =
         `ROI: ${f.toFixed(2)}× — ` +
         `(effective resale − cost − $${HASSLE.toFixed(0)} hassle) ÷ cost. ` +
-        `Cost = next bid × ${PURCHASE_PRICE_MULT.toFixed(1)}. ` +
+        `Cost = next bid × ${PURCHASE_PRICE_MULT.toFixed(1)}${multNote}. ` +
         `Effective resale = est. resale × condition factor.`;
     }
 
@@ -857,7 +855,9 @@
     if (costEl) {
       const cost = purchasePriceNum(item);
       costEl.textContent = isNaN(cost) ? "—" : "$" + cost.toFixed(2);
-      costEl.title = "Realistic out-of-pocket: next required bid × 1.3 (fees + tax)";
+      costEl.title = (bidMultiplierOf(item) > 1)
+        ? `Realistic out-of-pocket: next bid × 1.3 (fees + tax) × ${bidMultiplierOf(item)} (per-unit lot)`
+        : "Realistic out-of-pocket: next required bid × 1.3 (fees + tax)";
     }
     const resale = num(item.ai_estimated_resale);
     node.querySelector('[data-role="resale"]').textContent =
