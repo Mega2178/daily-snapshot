@@ -768,6 +768,15 @@ def recompute_all_flip_scores(items: dict[str, Item]) -> None:
 # ────────────────────────────── main ────────────────────────────────────────
 
 def main():
+    # Windows consoles default to cp1252 and crash on the →/✓/⛔/✨ characters
+    # this pipeline prints. Force UTF-8 on stdout/stderr; guarded so it's a
+    # no-op on old Pythons or streams that don't support reconfigure().
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError, OSError):
+            pass
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--scrape", action="store_true",
                         help="only scrape, don't call AI")

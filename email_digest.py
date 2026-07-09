@@ -426,6 +426,14 @@ def load_items() -> list[dict]:
 
 
 def main() -> int:
+    # Force UTF-8 stdout/stderr so Windows cp1252 consoles don't crash on the
+    # non-ASCII characters we print. Guarded for streams without reconfigure().
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError, OSError):
+            pass
+
     ap = argparse.ArgumentParser(description="Send the daily flip-digest email.")
     ap.add_argument("--dry-run", action="store_true",
                     help="build the email but don't send it")
